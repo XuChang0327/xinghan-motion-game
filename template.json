@@ -1,0 +1,20 @@
+{
+  "id": "simple-html",
+  "name": "Simple HTML + Vite",
+  "description": "简单的 HTML 项目，使用 Vite 作为开发服务器",
+  "type": "simple",
+  "version": "1.0.0",
+  "dependencies": {},
+  "devDependencies": {
+    "vite": "^5.4.2"
+  },
+  "features": [
+    "原生 HTML + CSS",
+    "Vite 开发服务器",
+    "HMR Bridge",
+    "最小依赖",
+    "快速启动"
+  ],
+  "port": 8000,
+  "keywords": ["html", "simple", "static"]
+}

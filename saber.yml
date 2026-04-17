@@ -1,0 +1,27 @@
+version: 2.0
+project_type: node
+ 
+stages:
+ - build
+ 
+variables:
+    DIST_PATH: .rush/dist/
+ 
+# online
+build-online:
+  stage: build
+  image: node:22.12.0
+  variables:
+    BUILD_ENV: online
+    DIST_PATH: .rush/dist/
+  script:
+    - npm install --registry http://npm.zhenguanyu.com
+    - npm run publish
+  artifacts:
+    name: build-online
+    upload: true
+    path:
+      - ".rush/dist/**"
+    tags:
+      - default
+      - online

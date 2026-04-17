@@ -1,0 +1,21 @@
+{
+  "name": "ESP32 串口监控",
+  "type": "module",
+  "version": "0.0.0",
+  "scripts": {
+    "dev": "NODE_ENV=development vite --host --port 8000",
+    "publish": "node scripts/publish.js"
+  },
+  "devDependencies": {
+    "vite": "^5.4.2"
+  },
+  "optionalDependencies": {
+    "@rollup/rollup-darwin-arm64": "^4.52.4",
+    "@rollup/rollup-darwin-x64": "^4.52.4",
+    "@rollup/rollup-linux-x64-gnu": "^4.52.4"
+  },
+  "dependencies": {
+    "@octopus-sdk/browser-rum": "latest",
+    "three": "^0.183.2"
+  }
+}
