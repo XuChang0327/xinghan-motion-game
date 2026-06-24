@@ -1,18 +1,39 @@
-// ===== ESP32 Serial Monitor (Dual Port Support) =====
+// ===== ESP32 Serial Monitor (Single Controller Support) =====
 
-// 双串口连接状态
+// Nordic UART Service（与常见 ESP32 BLE 固件一致，可按需改 UUID）
+const NUS_SERVICE_UUID = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
+const NUS_RX_CHAR_UUID = '6e400002-b5a3-f393-e0a9-e50e24dcca9e'; // Central 写入 → 设备接收
+const NUS_TX_CHAR_UUID = '6e400003-b5a3-f393-e0a9-e50e24dcca9e'; // 设备 Notify → 浏览器接收
+
+const HARDWARE_RESTORE_KEY = 'xhan-hardware-last-connection';
+
+// 单控制器连接状态：同一控制器可选择 USB 串口或 BLE 二选一连接。
 const serialPorts = {
-  port1: { port: null, reader: null, writer: null, isConnected: false, readableStreamClosed: null, label: '手柄 1' },
-  port2: { port: null, reader: null, writer: null, isConnected: false, readableStreamClosed: null, label: '手柄 2' },
+  port1: {
+    port: null,
+    reader: null,
+    writer: null,
+    isConnected: false,
+    readableStreamClosed: null,
+    label: '控制器',
+    transport: null,
+    bluetoothDevice: null,
+    gattServer: null,
+    nusRxChar: null,
+    nusTxChar: null,
+    bleNotifyHandler: null,
+    bleLineBuffer: '',
+    bleTextDecoder: null,
+    gattDisconnectHandler: null,
+  },
 };
 
-// 向后兼容：保留全局 isConnected（任一端口连接即为 true）
+// 向后兼容：保留全局 isConnected（控制器连接即为 true）
 let isConnected = false;
 
 // ===== 串口调试缓冲区（全局可见） =====
 window._serialDebug = {
   port1: { lastRaw: '', lastParsed: '', lastTime: 0, eventCount: 0 },
-  port2: { lastRaw: '', lastParsed: '', lastTime: 0, eventCount: 0 },
   // 事件追踪日志（最近 N 条事件的完整流转记录）
   eventLog: [],
   maxLogSize: 20,
@@ -31,45 +52,139 @@ let lineCount = 0;
 // DOM Elements
 const terminal = document.getElementById('terminal');
 const connectBtn1 = document.getElementById('connectBtn1');
-const connectBtn2 = document.getElementById('connectBtn2');
+const bleConnectBtn1 = document.getElementById('bleConnectBtn1');
 const statusDot1 = document.getElementById('statusDot1');
-const statusDot2 = document.getElementById('statusDot2');
 const statusText1 = document.getElementById('statusText1');
-const statusText2 = document.getElementById('statusText2');
 const portInfo1El = document.getElementById('portInfo1');
-const portInfo2El = document.getElementById('portInfo2');
 const lineCountEl = document.getElementById('lineCount');
 const autoScrollBtn = document.getElementById('autoScrollBtn');
 const sendInput = document.getElementById('sendInput');
 const sendBtn = document.getElementById('sendBtn');
 const baudRateSelect = document.getElementById('baudRate');
 const browserNotice = document.getElementById('browserNotice');
+const bluetoothNotice = document.getElementById('bluetoothNotice');
 const iframeNotice = document.getElementById('iframeNotice');
 const sendTargetSelect = document.getElementById('sendTarget');
+const bleFilterBar = document.getElementById('bleFilterBar');
+const bleFilterType = document.getElementById('bleFilterType');
+const bleFilterValue = document.getElementById('bleFilterValue');
+
+/**
+ * 构造 requestDevice 参数。
+ * 注意：很多 ESP 固件不会在 BLE 广播里声明 NUS UUID，此时 filters.services 会在扫描阶段 0 个设备，需用 acceptAllDevices 或仅 namePrefix。
+ * 连接成功后仍会 getPrimaryService(NUS) 校验协议。
+ */
+function buildBleRequestDeviceOptions() {
+  const optionalServices = [NUS_SERVICE_UUID];
+  const type = (bleFilterType && bleFilterType.value) || 'all';
+  const raw = (bleFilterValue && bleFilterValue.value) ? bleFilterValue.value.trim() : '';
+
+  if (type === 'all') {
+    return { acceptAllDevices: true, optionalServices };
+  }
+  if (type === 'nus') {
+    return { filters: [{ services: [NUS_SERVICE_UUID] }], optionalServices };
+  }
+  if (type === 'namePrefixNoSvc') {
+    if (!raw) return null;
+    return { filters: [{ namePrefix: raw }], optionalServices };
+  }
+  if (type === 'ybc') {
+    return {
+      filters: [
+        { services: [NUS_SERVICE_UUID], namePrefix: 'ybc' },
+        { services: [NUS_SERVICE_UUID], namePrefix: 'YBC' },
+      ],
+      optionalServices,
+    };
+  }
+  if (type === 'namePrefix') {
+    if (!raw) {
+      return { filters: [{ services: [NUS_SERVICE_UUID] }], optionalServices };
+    }
+    return { filters: [{ services: [NUS_SERVICE_UUID], namePrefix: raw }], optionalServices };
+  }
+  if (type === 'exactName') {
+    if (!raw) return null;
+    return { filters: [{ services: [NUS_SERVICE_UUID], name: raw }], optionalServices };
+  }
+  return { acceptAllDevices: true, optionalServices };
+}
+
+function syncBleFilterInputs() {
+  if (!bleFilterType || !bleFilterValue) return;
+  const t = bleFilterType.value;
+  const need = t === 'namePrefix' || t === 'exactName' || t === 'namePrefixNoSvc';
+  bleFilterValue.disabled = !need;
+  bleFilterValue.classList.toggle('is-disabled', !need);
+  if (t === 'exactName') {
+    bleFilterValue.placeholder = '完整蓝牙显示名称';
+  } else if (t === 'namePrefix' || t === 'namePrefixNoSvc') {
+    bleFilterValue.placeholder = t === 'namePrefixNoSvc' ? '设备名前缀，如 ESP、UART' : '名称前缀 + 须广播 NUS';
+  } else {
+    bleFilterValue.placeholder = '输入前缀或完整设备名';
+  }
+}
+
+function initBleFilterControls() {
+  if (!bleFilterType || !bleFilterValue) return;
+  const bleSecureWarn = document.getElementById('bleSecureWarn');
+  if (bleSecureWarn && window.location.protocol === 'file:') {
+    bleSecureWarn.style.display = 'block';
+    bleSecureWarn.textContent =
+      '检测到 file:// 打开：建议运行 pnpm dev，用 http://localhost 访问，蓝牙/串口在本地页面更稳定。';
+  }
+  try {
+    const st = localStorage.getItem('ble-filter-type');
+    const sv = localStorage.getItem('ble-filter-value');
+    if (st) bleFilterType.value = st;
+    if (sv !== null) bleFilterValue.value = sv;
+  } catch (e) { /* ignore */ }
+  syncBleFilterInputs();
+  bleFilterType.addEventListener('change', () => {
+    syncBleFilterInputs();
+    try {
+      localStorage.setItem('ble-filter-type', bleFilterType.value);
+    } catch (e) { /* ignore */ }
+  });
+  bleFilterValue.addEventListener('input', () => {
+    try {
+      localStorage.setItem('ble-filter-value', bleFilterValue.value);
+    } catch (e) { /* ignore */ }
+  });
+}
 
 // ===== 环境检测 =====
 const isInIframe = window.self !== window.top;
 
 function checkEnvironment() {
+  const serialOk = 'serial' in navigator;
+  const bleOk = 'bluetooth' in navigator;
+
   // 检查是否在 iframe 中
   if (isInIframe) {
     iframeNotice.style.display = 'flex';
     if (connectBtn1) connectBtn1.disabled = true;
-    if (connectBtn2) connectBtn2.disabled = true;
+    if (bleConnectBtn1) bleConnectBtn1.disabled = true;
+    if (bleFilterBar) bleFilterBar.style.display = 'none';
     sendInput.disabled = true;
     sendBtn.disabled = true;
     return false;
   }
 
-  // 检查浏览器是否支持 Web Serial API
-  if (!('serial' in navigator)) {
+  if (!serialOk) {
     browserNotice.style.display = 'flex';
     if (connectBtn1) connectBtn1.disabled = true;
-    if (connectBtn2) connectBtn2.disabled = true;
-    return false;
+  }
+  if (!bleOk) {
+    if (bluetoothNotice) bluetoothNotice.style.display = 'flex';
+    if (bleConnectBtn1) bleConnectBtn1.disabled = true;
+    if (bleFilterBar) bleFilterBar.style.display = 'none';
+  } else if (bleFilterBar) {
+    bleFilterBar.style.display = '';
   }
 
-  return true;
+  return serialOk || bleOk;
 }
 
 // 在新窗口中打开当前页面
@@ -81,13 +196,120 @@ function openInNewWindow() {
 
 // 执行环境检测
 const envReady = checkEnvironment();
+initBleFilterControls();
+restoreHardwareConnection();
 
-// ===== 连接/断开（双端口支持） =====
+// ===== 连接/断开（单控制器支持） =====
 function updateGlobalConnected() {
-  isConnected = serialPorts.port1.isConnected || serialPorts.port2.isConnected;
+  isConnected = serialPorts.port1.isConnected;
   // 更新发送栏
   sendInput.disabled = !isConnected;
   sendBtn.disabled = !isConnected;
+}
+
+function rememberHardwareConnection(data) {
+  try {
+    localStorage.setItem(HARDWARE_RESTORE_KEY, JSON.stringify({
+      ...data,
+      savedAt: Date.now(),
+    }));
+  } catch (e) { /* ignore */ }
+}
+
+function getRememberedHardwareConnection() {
+  try {
+    const raw = localStorage.getItem(HARDWARE_RESTORE_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+function clearRememberedHardwareConnection() {
+  try {
+    localStorage.removeItem(HARDWARE_RESTORE_KEY);
+  } catch (e) { /* ignore */ }
+}
+
+function describeSerialPort(port) {
+  if (!port || typeof port.getInfo !== 'function') return '';
+  const info = port.getInfo();
+  if (info.usbVendorId) {
+    return ` USB VID:${info.usbVendorId.toString(16).toUpperCase()} PID:${info.usbProductId?.toString(16).toUpperCase() || '----'}`;
+  }
+  return '';
+}
+
+function rememberSerialConnection(baudRate) {
+  rememberHardwareConnection({
+    transport: 'serial',
+    baudRate,
+  });
+}
+
+function rememberBleConnection(device) {
+  rememberHardwareConnection({
+    transport: 'ble',
+    deviceId: device && device.id ? device.id : '',
+    deviceName: device && device.name ? device.name : '',
+  });
+}
+
+async function attachSerialPort(portId, port, baudRate, options = {}) {
+  const sp = serialPorts[portId];
+  sp.port = port;
+  await sp.port.open({ baudRate });
+  sp.transport = 'serial';
+  sp.isConnected = true;
+
+  const portDesc = describeSerialPort(sp.port);
+  updateGlobalConnected();
+  updatePortUI(portId, portDesc);
+  appendLine('system', `[${sp.label}] 已连接（USB）— 波特率: ${baudRate}${portDesc}`, true);
+  if (!options.restored) {
+    appendLine('system', getPlatformHint(), true);
+  }
+  rememberSerialConnection(baudRate);
+  readLoopForPort(portId);
+}
+
+async function restoreSerialConnection(portId, saved) {
+  if (!('serial' in navigator) || typeof navigator.serial.getPorts !== 'function') return false;
+  const ports = await navigator.serial.getPorts();
+  if (!ports.length) return false;
+
+  const baudRate = parseInt(saved && saved.baudRate, 10) || parseInt(baudRateSelect.value, 10);
+  await attachSerialPort(portId, ports[0], baudRate, { restored: true });
+  appendLine('system', `[${serialPorts[portId].label}] 已自动恢复 USB 连接`, true);
+  return true;
+}
+
+async function restoreBleConnection(portId, saved) {
+  if (!('bluetooth' in navigator) || typeof navigator.bluetooth.getDevices !== 'function') return false;
+  const devices = await navigator.bluetooth.getDevices();
+  if (!devices.length) return false;
+
+  const device = devices.find(item => saved && saved.deviceId && item.id === saved.deviceId) || devices[0];
+  await attachBleDevice(portId, device, { restored: true });
+  appendLine('system', `[${serialPorts[portId].label}] 已自动恢复蓝牙连接`, true);
+  return true;
+}
+
+async function restoreHardwareConnection() {
+  if (!envReady) return;
+  const saved = getRememberedHardwareConnection();
+  if (!saved || serialPorts.port1.isConnected) return;
+
+  try {
+    if (saved.transport === 'serial') {
+      await restoreSerialConnection('port1', saved);
+    } else if (saved.transport === 'ble') {
+      await restoreBleConnection('port1', saved);
+    }
+  } catch (err) {
+    console.warn('Hardware restore failed:', err);
+    appendLine('system', '上次硬件连接未能自动恢复，请手动连接一次。', true);
+  }
 }
 
 async function toggleConnection(portId) {
@@ -102,26 +324,13 @@ async function toggleConnection(portId) {
 async function connectPort(portId) {
   const sp = serialPorts[portId];
   try {
-    sp.port = await navigator.serial.requestPort();
-    const baudRate = parseInt(baudRateSelect.value);
-    await sp.port.open({ baudRate });
-    sp.isConnected = true;
-
-    const info = sp.port.getInfo();
-    let portDesc = '';
-    if (info.usbVendorId) {
-      portDesc = ` USB VID:${info.usbVendorId.toString(16).toUpperCase()} PID:${info.usbProductId?.toString(16).toUpperCase() || '----'}`;
+    if (sp.isConnected && sp.transport === 'ble') {
+      await disconnectBle(portId, true);
     }
 
-    updateGlobalConnected();
-    updatePortUI(portId, portDesc);
-    appendLine('system', `[${sp.label}] 已连接 — 波特率: ${baudRate}${portDesc}`, true);
-
-    if (!serialPorts.port1.isConnected || portId === 'port1') {
-      appendLine('system', getPlatformHint(), true);
-    }
-
-    readLoopForPort(portId);
+    const port = await navigator.serial.requestPort();
+    const baudRate = parseInt(baudRateSelect.value, 10);
+    await attachSerialPort(portId, port, baudRate);
   } catch (err) {
     if (err.name === 'NotFoundError') return;
     appendLine('error', `[${sp.label}] 连接失败: ${err.message}`, true);
@@ -129,8 +338,9 @@ async function connectPort(portId) {
   }
 }
 
-async function disconnectPort(portId) {
+async function disconnectPort(portId, silentLog) {
   const sp = serialPorts[portId];
+  if (sp.transport !== 'serial') return;
   try {
     sp.isConnected = false;
 
@@ -146,13 +356,18 @@ async function disconnectPort(portId) {
       sp.port = null;
     }
     sp.reader = null;
+    sp.transport = null;
     updateGlobalConnected();
     updatePortUI(portId);
-    appendLine('system', `[${sp.label}] 已断开连接`, true);
+    if (!silentLog) {
+      clearRememberedHardwareConnection();
+      appendLine('system', `[${sp.label}] USB 已断开`, true);
+    }
   } catch (err) {
     sp.reader = null;
     sp.readableStreamClosed = null;
     sp.port = null;
+    sp.transport = null;
     updateGlobalConnected();
     updatePortUI(portId);
     appendLine('error', `[${sp.label}] 断开失败: ${err.message}`, true);
@@ -160,7 +375,50 @@ async function disconnectPort(portId) {
   }
 }
 
-// ===== 数据读取（按端口） =====
+function normalizeIncomingTextLine(line) {
+  // BLE NUS 有些固件会在文本包尾部带 NUL 或其它不可见控制字符。
+  return String(line || '').replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, '').trim();
+}
+
+function normalizeSingleControllerSource(source) {
+  // 当前框架只保留一个控制器；旧协议里的 P1/P2 前缀统一收敛为同一输入源。
+  return 'port1';
+}
+
+function dispatchIncomingLine(line, portId) {
+  const trimmed = normalizeIncomingTextLine(line);
+  if (trimmed.length > 0) {
+    handleSerialData(trimmed, portId);
+    if (_serialPanelVisible && _serialOutputEnabled) {
+      const upper = trimmed.toUpperCase();
+      const isHighFreq = upper.includes('RAW_JOY:') || upper.includes('DEGREE:') || upper.includes('MOTOR:') || upper.includes('GYRO:') || upper.includes('ANGLE|');
+      if (!isHighFreq) {
+        appendLine('received', `[控制器] ${trimmed}`);
+      }
+    }
+  }
+}
+
+/** 将文本块按行拆分并交给 handleSerialData / 终端（与 USB 读流、BLE notify 共用） */
+function processIncomingTextChunk(buffer, chunk, portId, options = {}) {
+  const chunkHasLineBreak = /\r|\n/.test(chunk);
+  buffer += chunk;
+  const lines = buffer.split(/\r?\n|\r/);
+  buffer = lines.pop() || '';
+  for (const line of lines) {
+    dispatchIncomingLine(line, portId);
+  }
+
+  // 一些 BLE NUS 固件每个 notify 就是一条协议消息，不额外附带 \n。
+  // USB 串口仍保留按行解析，避免半包数据被提前消费。
+  if (options.flushChunkWithoutLineBreak && !chunkHasLineBreak && lines.length === 1 && buffer.trim()) {
+    dispatchIncomingLine(buffer, portId);
+    buffer = '';
+  }
+  return buffer;
+}
+
+// ===== 数据读取（按端口，USB） =====
 async function readLoopForPort(portId) {
   const sp = serialPorts[portId];
   const decoder = new TextDecoderStream();
@@ -168,38 +426,16 @@ async function readLoopForPort(portId) {
   sp.reader = decoder.readable.getReader();
 
   let buffer = '';
-  const portLabel = portId === 'port1' ? '①' : '②';
 
   try {
     while (true) {
       const { value, done } = await sp.reader.read();
       if (done) break;
 
-      buffer += value;
-      // 兼容 \r\n、\n、\r 三种行终止符
-      const lines = buffer.split(/\r?\n|\r/);
-      buffer = lines.pop() || '';
-
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (trimmed.length > 0) {
-          // 🔴 先处理游戏逻辑（优先级最高，不应被终端输出阻塞）
-          handleSerialData(trimmed, portId);
-
-          // 终端输出：面板隐藏或输出关闭时跳过，无开销
-          // 高频数据（RAW_JOY、DEGREE、MOTOR、GYRO）跳过终端输出
-          if (_serialPanelVisible && _serialOutputEnabled) {
-            const upper = trimmed.toUpperCase();
-            const isHighFreq = upper.includes('RAW_JOY:') || upper.includes('DEGREE:') || upper.includes('MOTOR:') || upper.includes('GYRO:');
-            if (!isHighFreq) {
-              appendLine('received', `[${portLabel}] ${trimmed}`);
-            }
-          }
-        }
-      }
+      buffer = processIncomingTextChunk(buffer, value, portId);
     }
   } catch (err) {
-    if (sp.isConnected) {
+    if (sp.transport === 'serial' && sp.isConnected) {
       appendLine('error', `[${sp.label}] 读取错误: ${err.message}`, true);
     }
   } finally {
@@ -207,6 +443,188 @@ async function readLoopForPort(portId) {
       sp.reader.releaseLock();
       sp.reader = null;
     }
+  }
+}
+
+/** USB 或 BLE 统一写出（供终端与游戏内指令） */
+async function writeToPort(portId, text) {
+  const sp = serialPorts[portId];
+  if (!sp.isConnected) throw new Error('未连接');
+  const encoder = new TextEncoder();
+  const data = encoder.encode(text);
+  if (sp.transport === 'serial') {
+    if (!sp.port || !sp.port.writable) throw new Error('串口不可写');
+    const writable = sp.port.writable.getWriter();
+    await writable.write(data);
+    writable.releaseLock();
+  } else if (sp.transport === 'ble') {
+    if (!sp.nusRxChar) throw new Error('蓝牙特征未就绪');
+    await sp.nusRxChar.writeValue(data);
+  } else {
+    throw new Error('未知传输方式');
+  }
+}
+
+async function connectBlePort(portId) {
+  const sp = serialPorts[portId];
+  if (!('bluetooth' in navigator)) {
+    appendLine('error', '当前浏览器不支持 Web Bluetooth', true);
+    return;
+  }
+  try {
+    if (sp.isConnected && sp.transport === 'serial') {
+      await disconnectPort(portId, true);
+    }
+
+    const requestOpts = buildBleRequestDeviceOptions();
+    if (!requestOpts) {
+      const t = bleFilterType && bleFilterType.value;
+      let hint = '请检查蓝牙筛选条件。';
+      if (t === 'exactName') hint = '选择「精确名称 + NUS」时请在右侧填写完整蓝牙名称。';
+      else if (t === 'namePrefixNoSvc') hint = '选择「仅名称前缀」时请在右侧填写名称前缀以缩小列表。';
+      appendLine('error', hint, true);
+      return;
+    }
+    const device = await navigator.bluetooth.requestDevice(requestOpts);
+
+    await attachBleDevice(portId, device);
+  } catch (err) {
+    if (err.name === 'NotFoundError') return;
+    appendLine('error', `[${sp.label}] 蓝牙连接失败: ${err.message}`, true);
+    console.error(`BLE connect error (${portId}):`, err);
+    await cleanupFailedBleConnection(portId);
+  }
+}
+
+async function attachBleDevice(portId, device, options = {}) {
+  const sp = serialPorts[portId];
+  const server = await device.gatt.connect();
+  const service = await server.getPrimaryService(NUS_SERVICE_UUID);
+  const rxChar = await service.getCharacteristic(NUS_RX_CHAR_UUID);
+  const txChar = await service.getCharacteristic(NUS_TX_CHAR_UUID);
+
+  sp.bluetoothDevice = device;
+  sp.gattServer = server;
+  sp.nusRxChar = rxChar;
+  sp.nusTxChar = txChar;
+  sp.bleLineBuffer = '';
+  sp.bleTextDecoder = new TextDecoder();
+
+  const onNotify = (event) => {
+    const value = event.target.value;
+    if (!value) return;
+    const chunk = sp.bleTextDecoder.decode(value, { stream: true });
+    sp.bleLineBuffer = processIncomingTextChunk(sp.bleLineBuffer, chunk, portId, {
+      flushChunkWithoutLineBreak: true,
+    });
+  };
+  sp.bleNotifyHandler = onNotify;
+  txChar.addEventListener('characteristicvaluechanged', onNotify);
+
+  const onGattDisconnected = () => {
+    const cur = serialPorts[portId];
+    if (cur.transport === 'ble') {
+      disconnectBle(portId, true, true).then(() => {
+        appendLine('system', `[${serialPorts[portId].label}] 蓝牙连接已丢失`, true);
+      });
+    }
+  };
+  sp.gattDisconnectHandler = onGattDisconnected;
+  device.addEventListener('gattserverdisconnected', onGattDisconnected);
+
+  await txChar.startNotifications();
+
+  sp.transport = 'ble';
+  sp.isConnected = true;
+
+  const name = device.name || 'BLE 设备';
+  const portDesc = `BLE · ${name}`;
+  updateGlobalConnected();
+  updatePortUI(portId, portDesc);
+  appendLine('system', `[${sp.label}] 已连接（蓝牙）— ${portDesc}`, true);
+  rememberBleConnection(device);
+}
+
+/** 连接中途失败或需强制释放 GATT（transport 可能尚未设为 ble） */
+async function cleanupFailedBleConnection(portId) {
+  const sp = serialPorts[portId];
+  try {
+    if (sp.nusTxChar && sp.bleNotifyHandler) {
+      sp.nusTxChar.removeEventListener('characteristicvaluechanged', sp.bleNotifyHandler);
+      await sp.nusTxChar.stopNotifications().catch(() => {});
+    }
+    if (sp.bluetoothDevice && sp.gattDisconnectHandler) {
+      sp.bluetoothDevice.removeEventListener('gattserverdisconnected', sp.gattDisconnectHandler);
+    }
+    if (sp.bluetoothDevice && sp.bluetoothDevice.gatt.connected) {
+      await sp.bluetoothDevice.gatt.disconnect();
+    }
+  } catch (e) {
+    console.error(`BLE cleanup (${portId}):`, e);
+  } finally {
+    sp.bleNotifyHandler = null;
+    sp.nusTxChar = null;
+    sp.nusRxChar = null;
+    sp.gattServer = null;
+    sp.bluetoothDevice = null;
+    sp.bleLineBuffer = '';
+    sp.bleTextDecoder = null;
+    sp.gattDisconnectHandler = null;
+    sp.transport = null;
+    sp.isConnected = false;
+    updateGlobalConnected();
+    updatePortUI(portId);
+  }
+}
+
+/** @param silentLog 为 true 时不输出系统提示（内部清理用） @param skipDisconnect 仅清理状态不调用 gatt.disconnect */
+async function disconnectBle(portId, silentLog, skipGattDisconnect) {
+  const sp = serialPorts[portId];
+  if (sp.transport !== 'ble') return;
+  sp.isConnected = false;
+  try {
+    if (sp.nusTxChar && sp.bleNotifyHandler) {
+      sp.nusTxChar.removeEventListener('characteristicvaluechanged', sp.bleNotifyHandler);
+      await sp.nusTxChar.stopNotifications().catch(() => {});
+    }
+    if (!skipGattDisconnect && sp.bluetoothDevice && sp.bluetoothDevice.gatt.connected) {
+      await sp.bluetoothDevice.gatt.disconnect();
+    }
+  } catch (e) {
+    console.error(`BLE disconnect (${portId}):`, e);
+  } finally {
+    if (sp.bluetoothDevice && sp.gattDisconnectHandler) {
+      sp.bluetoothDevice.removeEventListener('gattserverdisconnected', sp.gattDisconnectHandler);
+    }
+    try {
+      if (sp.bleTextDecoder) sp.bleTextDecoder.decode();
+    } catch (e2) { /* ignore flush */ }
+    sp.bleNotifyHandler = null;
+    sp.nusTxChar = null;
+    sp.nusRxChar = null;
+    sp.gattServer = null;
+    sp.bluetoothDevice = null;
+    sp.bleLineBuffer = '';
+    sp.bleTextDecoder = null;
+    sp.gattDisconnectHandler = null;
+    sp.transport = null;
+    sp.reader = null;
+    sp.readableStreamClosed = null;
+    updateGlobalConnected();
+    updatePortUI(portId);
+    if (!silentLog) {
+      clearRememberedHardwareConnection();
+      appendLine('system', `[${sp.label}] 蓝牙已断开`, true);
+    }
+  }
+}
+
+async function toggleBleConnection(portId) {
+  const sp = serialPorts[portId];
+  if (sp.isConnected && sp.transport === 'ble') {
+    await disconnectBle(portId);
+  } else {
+    await connectBlePort(portId);
   }
 }
 
@@ -219,7 +637,7 @@ async function sendData() {
   const target = sendTargetSelect ? sendTargetSelect.value : 'port1';
   let targetPorts = [];
   if (target === 'all') {
-    targetPorts = ['port1', 'port2'].filter(id => serialPorts[id].isConnected);
+    targetPorts = ['port1'].filter(id => serialPorts[id].isConnected);
   } else {
     if (serialPorts[target] && serialPorts[target].isConnected) {
       targetPorts = [target];
@@ -232,21 +650,18 @@ async function sendData() {
   }
 
   try {
-    const encoder = new TextEncoder();
     const newline = document.getElementById('sendNewline').checked ? '\r\n' : '';
+    const payload = text + newline;
     for (const portId of targetPorts) {
-      const sp = serialPorts[portId];
-      const writable = sp.port.writable.getWriter();
-      await writable.write(encoder.encode(text + newline));
-      writable.releaseLock();
+      await writeToPort(portId, payload);
     }
-    const targetLabel = target === 'all' ? '全部' : serialPorts[target].label;
+    const targetLabel = serialPorts[target]?.label || '控制器';
     appendLine('sent', `[→${targetLabel}] ${text}`, true);
     sendInput.value = '';
     sendInput.focus();
   } catch (err) {
     appendLine('error', `发送失败: ${err.message}`, true);
-    console.error('Serial send error:', err);
+    console.error('Send error:', err);
   }
 }
 
@@ -419,52 +834,73 @@ function getPlatformHint() {
   }
 }
 
-// ===== UI 更新 (双端口) =====
+// ===== UI 更新（单控制器：USB / 蓝牙 独立按钮状态） =====
 function updatePortUI(portId, portDesc) {
   const sp = serialPorts[portId];
-  const dot = portId === 'port1' ? statusDot1 : statusDot2;
-  const text = portId === 'port1' ? statusText1 : statusText2;
-  const btn = portId === 'port1' ? connectBtn1 : connectBtn2;
-  const infoEl = portId === 'port1' ? portInfo1El : portInfo2El;
+  const dot = statusDot1;
+  const text = statusText1;
+  const btn = connectBtn1;
+  const bleBtn = bleConnectBtn1;
+  const infoEl = portInfo1El;
+
+  const serialActive = sp.transport === 'serial' && sp.isConnected;
+  const bleActive = sp.transport === 'ble' && sp.isConnected;
 
   if (dot) dot.classList.toggle('connected', sp.isConnected);
   if (text) text.textContent = sp.isConnected ? '已连接' : '未连接';
 
   if (btn) {
-    btn.classList.toggle('connected', sp.isConnected);
+    btn.classList.toggle('connected', serialActive);
     const spanEl = btn.querySelector('span');
-    if (spanEl) spanEl.textContent = sp.isConnected ? '断开' : '连接';
+    if (spanEl) spanEl.textContent = serialActive ? '断开' : '连接';
+  }
+
+  if (bleBtn) {
+    bleBtn.classList.toggle('connected', bleActive);
+    const spanEl = bleBtn.querySelector('span');
+    if (spanEl) spanEl.textContent = bleActive ? '断开' : '蓝牙';
   }
 
   if (infoEl) {
     if (sp.isConnected && portDesc) {
       infoEl.textContent = portDesc;
       infoEl.classList.add('visible');
+    } else if (sp.isConnected && !portDesc) {
+      if (serialActive) {
+        infoEl.textContent = 'USB 已连接';
+        infoEl.classList.add('visible');
+      } else if (bleActive) {
+        infoEl.textContent = '蓝牙已连接';
+        infoEl.classList.add('visible');
+      } else {
+        infoEl.textContent = '';
+        infoEl.classList.remove('visible');
+      }
     } else {
       infoEl.textContent = '';
       infoEl.classList.remove('visible');
     }
   }
 
-  // 波特率只有全部断开才可改
-  baudRateSelect.disabled = serialPorts.port1.isConnected || serialPorts.port2.isConnected;
+  baudRateSelect.disabled = serialPorts.port1.isConnected;
 }
 
 // 初始化自动滚动按钮状态
 if (autoScrollBtn) autoScrollBtn.classList.add('active');
 
-// 监听串口断开事件（双端口）
+// 监听串口断开事件（单控制器，仅 USB）
 if ('serial' in navigator) {
   navigator.serial.addEventListener('disconnect', (e) => {
-    for (const portId of ['port1', 'port2']) {
+    for (const portId of ['port1']) {
       const sp = serialPorts[portId];
-      if (sp.port && e.target === sp.port) {
+      if (sp.transport === 'serial' && sp.port && e.target === sp.port) {
         sp.isConnected = false;
         sp.reader = null;
         sp.port = null;
+        sp.transport = null;
         updateGlobalConnected();
         updatePortUI(portId);
-        appendLine('system', `[${sp.label}] 设备已断开`, true);
+        appendLine('system', `[${sp.label}] USB 设备已断开`, true);
       }
     }
   });
@@ -487,17 +923,11 @@ const gameTitle = document.getElementById('gameTitle');
 // 游戏信息映射
 const gameInfo = {
   none: { name: '选择游戏', subtitle: '选择一个游戏开始体验' },
-  pong: { name: '🏓 Pong 弹球', subtitle: '键盘 ↑↓ 或 W/S 控制挡板 · 支持串口手柄' },
-  snake: { name: '🐍 贪吃蛇', subtitle: '键盘 ↑↓←→ 或 WASD 控制方向 · 支持串口' },
-  dino: { name: '🦖 恐龙跳跃', subtitle: '按空格键跳跃 · 支持串口触发' },
-  jump: { name: '🦘 跳一跳', subtitle: '按住蓄力 · 松开跳跃 · 精准落点拿高分' },
-  fishing: { name: '🎣 钓鱼达人', subtitle: '50种鱼类 · 图鉴收集 · 串口手柄控制' },
-  ruler: { name: '📏 数字测量尺', subtitle: '精准测量工具 · 即将上线' },
-  gomoku: { name: '⚫ 五子棋', subtitle: '双手柄对战 · BTN落子 · 支持PVE/PVP' },
-  tank: { name: '🔫 90坦克大战', subtitle: '经典坦克大战 · 双人对战 · 串口手柄控制' },
-  pokemon: { name: '⚡ 宝可梦RPG', subtitle: '复古像素RPG · P2手柄控制 · 探索冒险' },
-  runner: { name: '🏃 3D 极速跑酷', subtitle: '3D跑酷 · 三跑道切换 · 虚拟摇杆控制' },
-  gyro: { name: '🎯 体感平衡球', subtitle: '陀螺仪体感控制 · 迷宫闯关 · 收集星星' },
+  pong: { name: '🏓 Pong 弹球', subtitle: '摇晃控制器开始 · 转动电机控制左侧挡板' },
+  snake: { name: '🐍 贪吃蛇', subtitle: '摇晃控制器开始 · 前后左右倾斜控制方向' },
+  dino: { name: '🦖 恐龙跳跃', subtitle: '摇晃控制器开始 · 转动电机跳跃' },
+  jump: { name: '🦘 数字测量尺', subtitle: '摇晃控制器开始 · 转动电机测距跳跃' },
+  fishing: { name: '🎣 钓鱼达人', subtitle: '摇晃控制器开始 / 继续 · 单电机 ANGLE| 卷线' },
 };
 
 function toggleGameMenu() {
@@ -523,6 +953,10 @@ document.addEventListener('click', (e) => {
 });
 
 function selectGame(gameId) {
+  if (!gameInfo[gameId]) {
+    gameId = 'none';
+  }
+
   // 停止当前游戏
   stopCurrentGame();
 
@@ -578,6 +1012,21 @@ function stopCurrentGame() {
   // 清除坦克全局引用
   window._tankPlayerShoot = null;
   window._tankStartLevel = null;
+  // 清除 Pong 全局引用
+  window._pongHandleDirection = null;
+  window._pongHandleButton = null;
+  window._pongHandleRawJoy = null;
+  window._pongHandleShake = null;
+  window._pongHandleMotorRawDeg = null;
+  // 清除贪吃蛇全局引用
+  window._snakeHandleShake = null;
+  window._snakeHandleDirection = null;
+  // 清除恐龙全局引用
+  window._dinoHandleShake = null;
+  window._dinoHandleMotorRawDeg = null;
+  // 清除跳一跳全局引用
+  window._jumpHandleShake = null;
+  window._jumpHandleMotorRawDeg = null;
   // 清除钓鱼全局引用
   window._fishingHandleDirection = null;
   window._fishingHandleButton = null;
@@ -586,6 +1035,8 @@ function stopCurrentGame() {
   window._fishingHandleFishCast = null;
   window._fishingHandleFishReel = null;
   window._fishingHandleFishShake = null;
+  window._fishingHandleMotorRawDeg = null;
+  window._fishingHandleGyroShake = null;
   // 清除宝可梦全局引用
   window._pokemonHandleDirection = null;
   window._pokemonHandleButton = null;
@@ -623,15 +1074,7 @@ function startGame(gameId) {
     case 'snake': startSnake(); break;
     case 'dino': startDino(); break;
     case 'jump': startJump(); break;
-    case 'gomoku': startGomoku(); break;
-    case 'tank': startTankBattle(); break;
     case 'fishing': startFishing(); break;
-    case 'pokemon': startPokemon(); break;
-    case 'runner': startRunner(); break;
-    case 'gyro': startGyroBalance(); break;
-    case 'ruler':
-      drawComingSoon(gameId);
-      break;
   }
 }
 
@@ -643,15 +1086,20 @@ function gameKeyHandler(e) {
   gameState.keys = gameState.keys || {};
   gameState.keys[e.key] = true;
 
-  // 恐龙跳跃的 space 特殊处理
+  // 恐龙跳跃的 space 特殊处理（键盘保留为无硬件调试入口）
   if (currentGame === 'dino' && e.key === ' ') {
-    if (gameState.dino && !gameState.dino.jumping) {
-      gameState.dino.vy = -13;
-      gameState.dino.jumping = true;
+    if (gameState.dino && !gameState.started) {
+      gameState.started = true;
+      return;
     }
     // 重新开始
     if (gameState.dino && gameState.dino.gameOver) {
       startDino();
+      return;
+    }
+    if (gameState.dino && !gameState.dino.jumping) {
+      gameState.dino.vy = -15;
+      gameState.dino.jumping = true;
     }
   }
 }
@@ -666,28 +1114,136 @@ function gameKeyUpHandler(e) {
 function startPong() {
   const W = gameCanvas.width, H = gameCanvas.height;
   const paddleH = 80, paddleW = 10, ballR = 8;
+  const leftX = 30;
+  const rightX = W - 30 - paddleW;
+  const paddleSpeed = 7;
+  const initialBallSpeed = 3.2;
+  const maxBallSpeed = 7.5;
+  const bounceAccel = 1.02;
+  const motorDegPerScreen = 180;
+  const motorFollowLerp = 0.72;
 
   gameState = {
     keys: gameState.keys || {},
+    mode: 'menu', // menu | playing
+    matchMode: 'single',
     playerY: H / 2 - paddleH / 2,
-    aiY: H / 2 - paddleH / 2,
+    rightY: H / 2 - paddleH / 2,
     ballX: W / 2, ballY: H / 2,
-    ballVX: 5, ballVY: 3,
-    playerScore: 0, aiScore: 0,
+    ballVX: initialBallSpeed, ballVY: 2,
+    playerLives: 3,
+    aiLives: 3,
+    result: null,
+    p1SerialMove: 0,
+    p2SerialMove: 0,
+    p1SerialUntil: 0,
+    p2SerialUntil: 0,
+    p1MotorAnchorDeg: null,
+    p1MotorTargetY: null,
+    lastMenuSerialAt: 0,
   };
+
+  window._pongHandleDirection = function(dir, source) {
+    const s = gameState;
+    if (!s || currentGame !== 'pong') return;
+
+    if (s.mode === 'menu') {
+      return;
+    }
+
+    const move = dir === 'UP' ? -1 : (dir === 'DOWN' ? 1 : 0);
+    if (source === 'port1') {
+      s.p1SerialMove = move;
+      s.p1SerialUntil = performance.now() + 180;
+    } else if (source === 'port2') {
+      s.p2SerialMove = move;
+      s.p2SerialUntil = performance.now() + 180;
+    }
+  };
+
+  window._pongHandleRawJoy = function(x, y, source) {
+    const s = gameState;
+    if (!s || currentGame !== 'pong') return;
+    if (s.mode === 'menu') {
+      return;
+    }
+    const move = y < 35 ? -1 : (y > 65 ? 1 : 0);
+    if (source === 'port1') {
+      s.p1SerialMove = move;
+      s.p1SerialUntil = performance.now() + 120;
+    } else if (source === 'port2') {
+      s.p2SerialMove = move;
+      s.p2SerialUntil = performance.now() + 120;
+    }
+  };
+
+  window._pongHandleButton = function(pressed, source) {
+    const s = gameState;
+    if (!s || currentGame !== 'pong' || !pressed) return;
+    // 开始游戏统一由陀螺仪摇晃触发；按钮保留给后续游戏内动作扩展。
+  };
+
+  window._pongHandleShake = function(source) {
+    const s = gameState;
+    if (!s || currentGame !== 'pong' || source !== 'port1') return;
+    if (s.mode === 'menu' || s.mode === 'gameover') startMatch();
+  };
+
+  window._pongHandleMotorRawDeg = function(rawDeg, source) {
+    const s = gameState;
+    if (!s || currentGame !== 'pong' || source !== 'port1' || s.mode !== 'playing') return;
+    if (s.p1MotorAnchorDeg === null) {
+      s.p1MotorAnchorDeg = rawDeg;
+    }
+    const relDeg = rawDeg - s.p1MotorAnchorDeg;
+    const travel = H - paddleH;
+    const centerY = travel / 2;
+    s.p1MotorTargetY = Math.max(0, Math.min(travel, centerY + (relDeg / motorDegPerScreen) * travel));
+  };
+
+  function startMatch() {
+    const s = gameState;
+    s.mode = 'playing';
+    s.matchMode = 'single';
+    s.playerLives = 3;
+    s.aiLives = 3;
+    s.result = null;
+    s.playerY = H / 2 - paddleH / 2;
+    s.rightY = H / 2 - paddleH / 2;
+    s.p1MotorAnchorDeg = null;
+    s.p1MotorTargetY = null;
+    if (typeof writeToPort === 'function' && serialPorts.port1 && serialPorts.port1.isConnected) {
+      writeToPort('port1', 'RESET\n').catch(() => {});
+    }
+    resetPongBall(s, W, H, Math.random() > 0.5 ? 1 : -1);
+  }
 
   function update() {
     const s = gameState;
-    // 玩家移动
-    if (s.keys['ArrowUp'] || s.keys['w']) s.playerY -= 6;
-    if (s.keys['ArrowDown'] || s.keys['s']) s.playerY += 6;
+    if (s.mode !== 'playing') {
+      if (s.keys['Enter'] || s.keys[' ']) startMatch();
+      return;
+    }
+
+    const now = performance.now();
+
+    // 左挡板：控制器电机为主控，键盘 / 控制器方向保留为调试输入。
+    let p1Move = 0;
+    if (s.keys['ArrowUp'] || (s.matchMode === 'single' && s.keys['w'])) p1Move -= 1;
+    if (s.keys['ArrowDown'] || (s.matchMode === 'single' && s.keys['s'])) p1Move += 1;
+    if (now <= s.p1SerialUntil) p1Move += s.p1SerialMove;
+    if (s.p1MotorTargetY !== null) {
+      s.playerY += (s.p1MotorTargetY - s.playerY) * motorFollowLerp;
+    }
+    if (p1Move < 0) s.playerY -= paddleSpeed;
+    if (p1Move > 0) s.playerY += paddleSpeed;
     s.playerY = Math.max(0, Math.min(H - paddleH, s.playerY));
 
-    // AI 移动
-    const aiCenter = s.aiY + paddleH / 2;
-    if (aiCenter < s.ballY - 15) s.aiY += 4;
-    if (aiCenter > s.ballY + 15) s.aiY -= 4;
-    s.aiY = Math.max(0, Math.min(H - paddleH, s.aiY));
+    // 单人模式右侧由 AI 控制。
+    const aiCenter = s.rightY + paddleH / 2;
+    if (aiCenter < s.ballY - 15) s.rightY += 3.2;
+    if (aiCenter > s.ballY + 15) s.rightY -= 3.2;
+    s.rightY = Math.max(0, Math.min(H - paddleH, s.rightY));
 
     // 球移动
     s.ballX += s.ballVX;
@@ -700,34 +1256,52 @@ function startPong() {
     }
 
     // 左挡板碰撞
-    if (s.ballX - ballR < 30 + paddleW && s.ballY > s.playerY && s.ballY < s.playerY + paddleH && s.ballVX < 0) {
-      s.ballVX = -s.ballVX * 1.05;
-      s.ballX = 30 + paddleW + ballR;
+    if (s.ballX - ballR < leftX + paddleW && s.ballY > s.playerY && s.ballY < s.playerY + paddleH && s.ballVX < 0) {
+      s.ballVX = -s.ballVX * bounceAccel;
+      s.ballX = leftX + paddleW + ballR;
       const offset = (s.ballY - (s.playerY + paddleH / 2)) / (paddleH / 2);
-      s.ballVY = offset * 6;
+      s.ballVY = offset * 4.5;
     }
 
     // 右挡板碰撞
-    if (s.ballX + ballR > W - 30 - paddleW && s.ballY > s.aiY && s.ballY < s.aiY + paddleH && s.ballVX > 0) {
-      s.ballVX = -s.ballVX * 1.05;
-      s.ballX = W - 30 - paddleW - ballR;
-      const offset = (s.ballY - (s.aiY + paddleH / 2)) / (paddleH / 2);
-      s.ballVY = offset * 6;
+    if (s.ballX + ballR > rightX && s.ballY > s.rightY && s.ballY < s.rightY + paddleH && s.ballVX > 0) {
+      s.ballVX = -s.ballVX * bounceAccel;
+      s.ballX = rightX - ballR;
+      const offset = (s.ballY - (s.rightY + paddleH / 2)) / (paddleH / 2);
+      s.ballVY = offset * 4.5;
     }
 
     // 限速
-    const maxSpeed = 12;
-    s.ballVX = Math.max(-maxSpeed, Math.min(maxSpeed, s.ballVX));
+    s.ballVX = Math.max(-maxBallSpeed, Math.min(maxBallSpeed, s.ballVX));
+    s.ballVY = Math.max(-maxBallSpeed, Math.min(maxBallSpeed, s.ballVY));
 
-    // 得分
-    if (s.ballX < 0) { s.aiScore++; resetPongBall(s, W, H); }
-    if (s.ballX > W) { s.playerScore++; resetPongBall(s, W, H); }
+    // 漏球扣心：玩家守左侧，AI 守右侧。
+    if (s.ballX < 0) {
+      s.playerLives = Math.max(0, s.playerLives - 1);
+      if (s.playerLives <= 0) finishMatch('failure');
+      else resetPongBall(s, W, H, 1);
+    }
+    if (s.ballX > W) {
+      s.aiLives = Math.max(0, s.aiLives - 1);
+      if (s.aiLives <= 0) finishMatch('victory');
+      else resetPongBall(s, W, H, -1);
+    }
   }
 
-  function resetPongBall(s, W, H) {
+  function resetPongBall(s, W, H, dir) {
     s.ballX = W / 2; s.ballY = H / 2;
-    s.ballVX = (Math.random() > 0.5 ? 1 : -1) * 5;
-    s.ballVY = (Math.random() - 0.5) * 6;
+    s.ballVX = (dir || (Math.random() > 0.5 ? 1 : -1)) * initialBallSpeed;
+    s.ballVY = (Math.random() - 0.5) * 3.2;
+  }
+
+  function finishMatch(result) {
+    const s = gameState;
+    s.mode = 'gameover';
+    s.result = result;
+    s.ballX = W / 2;
+    s.ballY = H / 2;
+    s.ballVX = 0;
+    s.ballVY = 0;
   }
 
   function draw() {
@@ -735,6 +1309,11 @@ function startPong() {
     const ctx = gameCtx;
     ctx.fillStyle = '#12141c';
     ctx.fillRect(0, 0, W, H);
+
+    if (s.mode === 'menu') {
+      drawPongMenu(ctx, s);
+      return;
+    }
 
     // 中线
     ctx.setLineDash([8, 8]);
@@ -750,11 +1329,11 @@ function startPong() {
     ctx.fillStyle = '#22d3ee';
     ctx.shadowColor = 'rgba(34,211,238,0.4)';
     ctx.shadowBlur = 12;
-    ctx.fillRect(30, s.playerY, paddleW, paddleH);
+    ctx.fillRect(leftX, s.playerY, paddleW, paddleH);
 
     ctx.fillStyle = '#f87171';
     ctx.shadowColor = 'rgba(248,113,113,0.4)';
-    ctx.fillRect(W - 30 - paddleW, s.aiY, paddleW, paddleH);
+    ctx.fillRect(rightX, s.rightY, paddleW, paddleH);
     ctx.shadowBlur = 0;
 
     // 球
@@ -766,12 +1345,83 @@ function startPong() {
     ctx.fill();
     ctx.shadowBlur = 0;
 
-    // 分数
-    ctx.fillStyle = 'rgba(255,255,255,0.2)';
+    // 生命值
+    ctx.font = 'bold 22px sans-serif';
+    ctx.textAlign = 'left';
+    ctx.fillStyle = '#22d3ee';
+    ctx.fillText(`玩家 ${drawHearts(s.playerLives)}`, 22, 34);
+    ctx.textAlign = 'right';
+    ctx.fillStyle = '#f87171';
+    ctx.fillText(`AI ${drawHearts(s.aiLives)}`, W - 22, 34);
+
+    ctx.fillStyle = 'rgba(255,255,255,0.35)';
+    ctx.font = '13px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('转动电机控制左侧挡板，右侧为 AI', W / 2, H - 18);
+
+    if (s.mode === 'gameover') {
+      drawPongResult(ctx, s);
+    }
+  }
+
+  function drawHearts(count) {
+    return '♥'.repeat(count) + '♡'.repeat(3 - count);
+  }
+
+  function drawPongResult(ctx, s) {
+    const isVictory = s.result === 'victory';
+    ctx.fillStyle = 'rgba(0,0,0,0.68)';
+    ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = isVictory ? '#34d399' : '#f87171';
     ctx.font = 'bold 48px sans-serif';
     ctx.textAlign = 'center';
-    ctx.fillText(s.playerScore, W / 2 - 60, 60);
-    ctx.fillText(s.aiScore, W / 2 + 60, 60);
+    ctx.fillText(isVictory ? '游戏胜利' : '游戏失败', W / 2, H / 2 - 24);
+    ctx.fillStyle = 'rgba(255,255,255,0.72)';
+    ctx.font = '18px sans-serif';
+    ctx.fillText(`玩家 ${drawHearts(s.playerLives)}   AI ${drawHearts(s.aiLives)}`, W / 2, H / 2 + 18);
+    ctx.fillStyle = 'rgba(255,255,255,0.46)';
+    ctx.font = '15px sans-serif';
+    ctx.fillText('摇晃控制器重新开始', W / 2, H / 2 + 58);
+  }
+
+  function drawPongMenu(ctx, s) {
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 50px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('Pong 弹球', W / 2, 120);
+
+    ctx.fillStyle = 'rgba(255,255,255,0.45)';
+    ctx.font = '16px sans-serif';
+    ctx.fillText('摇晃控制器以开始游戏', W / 2, 154);
+
+    const options = [
+      { title: '开始游戏', desc: '摇晃开始 · 转动电机控制左侧挡板' },
+    ];
+    for (let i = 0; i < options.length; i++) {
+      const boxW = 360;
+      const boxH = 70;
+      const x = W / 2 - boxW / 2;
+      const y = 250;
+
+      ctx.fillStyle = 'rgba(34,211,238,0.14)';
+      ctx.strokeStyle = '#22d3ee';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.roundRect(x, y, boxW, boxH, 14);
+      ctx.fill();
+      ctx.stroke();
+
+      ctx.fillStyle = '#fff';
+      ctx.font = 'bold 22px sans-serif';
+      ctx.fillText(options[i].title, W / 2, y + 30);
+      ctx.fillStyle = 'rgba(255,255,255,0.62)';
+      ctx.font = '13px sans-serif';
+      ctx.fillText(options[i].desc, W / 2, y + 52);
+    }
+
+    ctx.fillStyle = 'rgba(255,255,255,0.38)';
+    ctx.font = '14px sans-serif';
+    ctx.fillText('摇晃控制器以开始游戏', W / 2, H - 34);
   }
 
   function loop() {
@@ -788,6 +1438,10 @@ function startSnake() {
   const CELL = 20;
   const COLS = Math.floor(W / CELL);
   const ROWS = Math.floor(H / CELL);
+  const SNAKE_INITIAL_SPEED = 220;
+  const SNAKE_MIN_SPEED = 90;
+  const SNAKE_SPEED_STEP = 8;
+  const EDGE_GRACE_MS = 500;
 
   const startX = Math.floor(COLS / 2);
   const startY = Math.floor(ROWS / 2);
@@ -800,11 +1454,45 @@ function startSnake() {
     food: null,
     score: 0,
     gameOver: false,
+    started: false,
     lastMove: 0,
-    speed: 120,
+    speed: SNAKE_INITIAL_SPEED,
+    edgeGraceUntil: 0,
+    edgeGraceDir: null,
   };
 
   placeSnakeFood();
+
+  window._snakeHandleShake = function(source) {
+    if (currentGame !== 'snake' || source !== 'port1') return;
+    if (gameState.gameOver) {
+      startSnake();
+      return;
+    }
+    if (!gameState.started) {
+      gameState.started = true;
+      gameState.lastMove = performance.now();
+    }
+  };
+
+  window._snakeHandleDirection = function(dir, source) {
+    if (currentGame !== 'snake' || source !== 'port1') return;
+    const s = gameState;
+    if (!s || s.gameOver || !s.started) return;
+
+    const dirMap = {
+      UP: { x: 0, y: -1 },
+      DOWN: { x: 0, y: 1 },
+      LEFT: { x: -1, y: 0 },
+      RIGHT: { x: 1, y: 0 },
+    };
+    const next = dirMap[dir];
+    if (!next) return;
+
+    // 禁止直接掉头，避免硬件连续姿态事件造成误触。
+    if (s.dir.x + next.x === 0 && s.dir.y + next.y === 0) return;
+    s.nextDir = next;
+  };
 
   function placeSnakeFood() {
     const s = gameState;
@@ -817,7 +1505,7 @@ function startSnake() {
 
   function update(timestamp) {
     const s = gameState;
-    if (s.gameOver) return;
+    if (s.gameOver || !s.started) return;
 
     // 方向输入
     if ((s.keys['ArrowUp'] || s.keys['w']) && s.dir.y === 0) s.nextDir = { x: 0, y: -1 };
@@ -831,11 +1519,21 @@ function startSnake() {
 
     const head = { x: s.snake[0].x + s.dir.x, y: s.snake[0].y + s.dir.y };
 
-    // 穿墙
-    if (head.x < 0) head.x = COLS - 1;
-    if (head.x >= COLS) head.x = 0;
-    if (head.y < 0) head.y = ROWS - 1;
-    if (head.y >= ROWS) head.y = 0;
+    // 撞到边缘时先给一个短暂转向窗口，超时仍朝边缘移动才失败。
+    if (head.x < 0 || head.x >= COLS || head.y < 0 || head.y >= ROWS) {
+      const edgeDir = `${s.dir.x},${s.dir.y}`;
+      if (!s.edgeGraceUntil || s.edgeGraceDir !== edgeDir) {
+        s.edgeGraceUntil = timestamp + EDGE_GRACE_MS;
+        s.edgeGraceDir = edgeDir;
+        return;
+      }
+      if (timestamp >= s.edgeGraceUntil) {
+        s.gameOver = true;
+      }
+      return;
+    }
+    s.edgeGraceUntil = 0;
+    s.edgeGraceDir = null;
 
     // 撞自己
     if (s.snake.some(seg => seg.x === head.x && seg.y === head.y)) {
@@ -848,7 +1546,8 @@ function startSnake() {
     // 吃食物
     if (s.food && head.x === s.food.x && head.y === s.food.y) {
       s.score += 10;
-      s.speed = Math.max(60, s.speed - 2);
+      const eatenCount = Math.floor(s.score / 10);
+      s.speed = Math.max(SNAKE_MIN_SPEED, SNAKE_INITIAL_SPEED - eatenCount * SNAKE_SPEED_STEP);
       placeSnakeFood();
     } else {
       s.snake.pop();
@@ -898,10 +1597,42 @@ function startSnake() {
     }
 
     // 分数
-    ctx.fillStyle = 'rgba(255,255,255,0.2)';
+    ctx.fillStyle = 'rgba(15,23,42,0.78)';
+    ctx.fillRect(12, 12, 116, 34);
+    ctx.strokeStyle = 'rgba(52,211,153,0.42)';
+    ctx.strokeRect(12, 12, 116, 34);
+    ctx.fillStyle = '#e5fff5';
     ctx.font = 'bold 20px sans-serif';
     ctx.textAlign = 'left';
-    ctx.fillText(`分数: ${s.score}`, 16, 30);
+    ctx.fillText(`分数: ${s.score}`, 22, 35);
+
+    const edgeGraceRemaining = s.edgeGraceUntil ? Math.max(0, s.edgeGraceUntil - performance.now()) : 0;
+    if (s.started && edgeGraceRemaining > 0) {
+      const pulse = 0.45 + 0.25 * Math.sin(performance.now() / 80);
+      ctx.strokeStyle = `rgba(251,191,36,${pulse})`;
+      ctx.lineWidth = 6;
+      ctx.strokeRect(3, 3, W - 6, H - 6);
+      ctx.fillStyle = 'rgba(251,191,36,0.92)';
+      ctx.font = 'bold 18px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText('快转向！撞到边缘会失败', W / 2, 36);
+    }
+
+    if (!s.started) {
+      ctx.fillStyle = 'rgba(0,0,0,0.55)';
+      ctx.fillRect(0, 0, W, H);
+      ctx.fillStyle = '#34d399';
+      ctx.font = 'bold 42px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText('贪吃蛇', W / 2, H / 2 - 40);
+      ctx.fillStyle = 'rgba(255,255,255,0.72)';
+      ctx.font = '20px sans-serif';
+      ctx.fillText('摇晃控制器开始游戏', W / 2, H / 2 + 8);
+      ctx.fillStyle = 'rgba(255,255,255,0.42)';
+      ctx.font = '14px sans-serif';
+      ctx.fillText('开始后前后左右倾斜控制方向；键盘调试：方向键 / WASD', W / 2, H / 2 + 40);
+      return;
+    }
 
     // Game Over
     if (s.gameOver) {
@@ -913,13 +1644,19 @@ function startSnake() {
       ctx.fillText('GAME OVER', W / 2, H / 2 - 10);
       ctx.fillStyle = 'rgba(255,255,255,0.5)';
       ctx.font = '16px sans-serif';
-      ctx.fillText(`最终得分: ${s.score}  |  按 R 重新开始`, W / 2, H / 2 + 25);
+      ctx.fillText(`最终得分: ${s.score}  |  摇晃控制器 / 按 R 重新开始`, W / 2, H / 2 + 25);
     }
   }
 
   // R 键重新开始
   const originalKeyHandler = gameKeyHandler;
   const snakeRestartHandler = (e) => {
+    if ((e.key === ' ' || e.key === 'Enter') && !gameState.started && currentGame === 'snake') {
+      e.preventDefault();
+      gameState.started = true;
+      gameState.lastMove = performance.now();
+      return;
+    }
     if (e.key === 'r' || e.key === 'R') {
       if (gameState.gameOver && currentGame === 'snake') {
         startSnake();
@@ -939,8 +1676,23 @@ function startSnake() {
 
 // ========== 恐龙跳跃 ==========
 function startDino() {
+  if (gameAnimationId) {
+    cancelAnimationFrame(gameAnimationId);
+    gameAnimationId = null;
+  }
+
   const W = gameCanvas.width, H = gameCanvas.height;
   const GROUND_Y = H - 60;
+  const BASE_SPEED = 2.4;
+  const MAX_SPEED = 5.8;
+  const MIN_OBSTACLE_GAP = 340;
+  const RANDOM_OBSTACLE_GAP = 420;
+  const DISTANCE_PER_PIXEL_M = 0.02;
+  const SPEED_ACCEL_PER_M = 0.014;
+  const MOTOR_JUMP_DEG = 28;
+  const MOTOR_JUMP_COOLDOWN_MS = 250;
+  const MOTOR_MOVE_EPS_DEG = 1.5;
+  const MOTOR_REARM_STOP_MS = 220;
 
   gameState = {
     keys: gameState.keys || {},
@@ -950,11 +1702,19 @@ function startDino() {
     },
     obstacles: [],
     clouds: [],
-    score: 0,
-    speed: 5,
+    distanceM: 0,
+    speed: BASE_SPEED,
     frame: 0,
     lastObstacle: 0,
+    nextObstacleGap: createObstacleGap(),
     groundOffset: 0,
+    started: false,
+    dinoMotorAnchorDeg: null,
+    dinoLastJumpDeg: null,
+    dinoLastMotorJumpAt: 0,
+    dinoLastMotorRawDeg: null,
+    dinoLastMotorMoveAt: 0,
+    dinoMotorJumpArmed: true,
   };
 
   // 初始化云朵
@@ -966,14 +1726,92 @@ function startDino() {
     });
   }
 
+  function createObstacleGap() {
+    return MIN_OBSTACLE_GAP + Math.random() * RANDOM_OBSTACLE_GAP;
+  }
+
+  function createObstacle() {
+    const variants = [
+      { type: 'cactus', color: '#34d399', accent: '#10b981' },
+      { type: 'rock', color: '#a78bfa', accent: '#7c3aed' },
+      { type: 'crystal', color: '#fbbf24', accent: '#f97316' },
+    ];
+    const variant = variants[Math.floor(Math.random() * variants.length)];
+    const h = 28 + Math.random() * 26;
+    const w = variant.type === 'rock' ? 28 + Math.random() * 14 : 20 + Math.random() * 12;
+
+    return {
+      x: W + 10,
+      y: GROUND_Y - h,
+      w,
+      h,
+      ...variant,
+    };
+  }
+
+  window._dinoHandleShake = function(source) {
+    if (currentGame !== 'dino' || source !== 'port1') return;
+    const s = gameState;
+    if (!s.dino) return;
+
+    if (s.dino.gameOver) {
+      startDino();
+      return;
+    }
+
+    if (!s.started) {
+      s.started = true;
+    }
+  };
+
+  window._dinoHandleMotorRawDeg = function(rawDeg, source) {
+    if (currentGame !== 'dino' || source !== 'port1') return;
+    const s = gameState;
+    if (!s.dino || !s.started || s.dino.gameOver) return;
+
+    if (s.dinoMotorAnchorDeg == null) {
+      s.dinoMotorAnchorDeg = rawDeg;
+      s.dinoLastJumpDeg = rawDeg;
+      s.dinoLastMotorRawDeg = rawDeg;
+      return;
+    }
+
+    const now = performance.now();
+    const rawDelta = Math.abs(rawDeg - s.dinoLastMotorRawDeg);
+    s.dinoLastMotorRawDeg = rawDeg;
+    if (rawDelta > MOTOR_MOVE_EPS_DEG) {
+      s.dinoLastMotorMoveAt = now;
+    } else if (!s.dino.jumping && !s.dinoMotorJumpArmed && now - s.dinoLastMotorMoveAt >= MOTOR_REARM_STOP_MS) {
+      s.dinoMotorJumpArmed = true;
+      s.dinoLastJumpDeg = rawDeg;
+    }
+
+    if (!s.dinoMotorJumpArmed) {
+      return;
+    }
+
+    const jumpDelta = Math.abs(rawDeg - s.dinoLastJumpDeg);
+    if (jumpDelta < MOTOR_JUMP_DEG || now - s.dinoLastMotorJumpAt < MOTOR_JUMP_COOLDOWN_MS) {
+      return;
+    }
+
+    s.dinoLastJumpDeg = rawDeg;
+    s.dinoLastMotorJumpAt = now;
+    s.dinoMotorJumpArmed = false;
+    if (!s.dino.jumping) {
+      s.dino.vy = -15;
+      s.dino.jumping = true;
+    }
+  };
+
   function update() {
     const s = gameState;
     const d = s.dino;
-    if (d.gameOver) return;
+    if (d.gameOver || !s.started) return;
 
     s.frame++;
-    s.score = Math.floor(s.frame / 6);
-    s.speed = 5 + s.score * 0.008;
+    s.distanceM += s.speed * DISTANCE_PER_PIXEL_M;
+    s.speed = Math.min(MAX_SPEED, BASE_SPEED + s.distanceM * SPEED_ACCEL_PER_M);
 
     // 恐龙物理
     d.vy += 0.7; // 重力
@@ -989,10 +1827,10 @@ function startDino() {
 
     // 生成障碍
     s.lastObstacle += s.speed;
-    if (s.lastObstacle > 200 + Math.random() * 150) {
-      const h = 30 + Math.random() * 30;
-      s.obstacles.push({ x: W + 10, w: 20 + Math.random() * 10, h: h, y: GROUND_Y - h + d.h });
+    if (s.lastObstacle > s.nextObstacleGap) {
+      s.obstacles.push(createObstacle());
       s.lastObstacle = 0;
+      s.nextObstacleGap = createObstacleGap();
     }
 
     // 移动障碍
@@ -1040,16 +1878,16 @@ function startDino() {
     ctx.strokeStyle = 'rgba(255,255,255,0.12)';
     ctx.lineWidth = 1;
     ctx.beginPath();
-    ctx.moveTo(0, GROUND_Y + d.h);
-    ctx.lineTo(W, GROUND_Y + d.h);
+    ctx.moveTo(0, GROUND_Y);
+    ctx.lineTo(W, GROUND_Y);
     ctx.stroke();
 
     // 地面纹理
     ctx.strokeStyle = 'rgba(255,255,255,0.05)';
     for (let x = -s.groundOffset; x < W; x += 20) {
       ctx.beginPath();
-      ctx.moveTo(x, GROUND_Y + d.h + 4);
-      ctx.lineTo(x + 10, GROUND_Y + d.h + 4);
+      ctx.moveTo(x, GROUND_Y + 4);
+      ctx.lineTo(x + 10, GROUND_Y + 4);
       ctx.stroke();
     }
 
@@ -1085,23 +1923,58 @@ function startDino() {
     ctx.fillRect(dx, dy + 8, 10, 6);
     ctx.shadowBlur = 0;
 
-    // 障碍物（仙人掌风格）
-    ctx.fillStyle = '#f87171';
-    ctx.shadowColor = 'rgba(248,113,113,0.3)';
+    // 障碍物
     ctx.shadowBlur = 6;
     s.obstacles.forEach(o => {
-      ctx.fillRect(o.x, o.y, o.w, o.h);
-      // 小臂
-      ctx.fillRect(o.x - 4, o.y + o.h * 0.3, 6, o.h * 0.2);
-      ctx.fillRect(o.x + o.w - 2, o.y + o.h * 0.5, 6, o.h * 0.15);
+      ctx.fillStyle = o.color;
+      ctx.shadowColor = o.color;
+      if (o.type === 'rock') {
+        ctx.beginPath();
+        ctx.roundRect(o.x, o.y + o.h * 0.15, o.w, o.h * 0.85, 8);
+        ctx.fill();
+        ctx.fillStyle = o.accent;
+        ctx.fillRect(o.x + o.w * 0.18, o.y + o.h * 0.38, o.w * 0.28, 5);
+      } else if (o.type === 'crystal') {
+        ctx.beginPath();
+        ctx.moveTo(o.x + o.w / 2, o.y);
+        ctx.lineTo(o.x + o.w, o.y + o.h * 0.45);
+        ctx.lineTo(o.x + o.w * 0.75, o.y + o.h);
+        ctx.lineTo(o.x + o.w * 0.25, o.y + o.h);
+        ctx.lineTo(o.x, o.y + o.h * 0.45);
+        ctx.closePath();
+        ctx.fill();
+        ctx.fillStyle = o.accent;
+        ctx.fillRect(o.x + o.w * 0.48, o.y + o.h * 0.18, 4, o.h * 0.62);
+      } else {
+        ctx.fillRect(o.x, o.y, o.w, o.h);
+        ctx.fillStyle = o.accent;
+        ctx.fillRect(o.x - 4, o.y + o.h * 0.3, 6, o.h * 0.2);
+        ctx.fillRect(o.x + o.w - 2, o.y + o.h * 0.5, 6, o.h * 0.15);
+      }
     });
     ctx.shadowBlur = 0;
 
-    // 分数
+    // 距离
     ctx.fillStyle = 'rgba(255,255,255,0.25)';
     ctx.font = 'bold 20px monospace';
     ctx.textAlign = 'right';
-    ctx.fillText(String(s.score).padStart(5, '0'), W - 20, 30);
+    ctx.fillText(`${s.distanceM.toFixed(1)} m`, W - 20, 30);
+
+    if (!s.started) {
+      ctx.fillStyle = 'rgba(0,0,0,0.55)';
+      ctx.fillRect(0, 0, W, H);
+      ctx.fillStyle = '#22d3ee';
+      ctx.font = 'bold 42px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText('恐龙跳跃', W / 2, H / 2 - 40);
+      ctx.fillStyle = 'rgba(255,255,255,0.72)';
+      ctx.font = '20px sans-serif';
+      ctx.fillText('摇晃控制器开始游戏', W / 2, H / 2 + 8);
+      ctx.fillStyle = 'rgba(255,255,255,0.42)';
+      ctx.font = '14px sans-serif';
+      ctx.fillText('开始后转动电机跳跃 · 空格键可调试', W / 2, H / 2 + 40);
+      return;
+    }
 
     // Game Over
     if (d.gameOver) {
@@ -1113,7 +1986,7 @@ function startDino() {
       ctx.fillText('GAME OVER', W / 2, H / 2 - 10);
       ctx.fillStyle = 'rgba(255,255,255,0.5)';
       ctx.font = '16px sans-serif';
-      ctx.fillText(`得分: ${s.score}  |  按空格键重新开始`, W / 2, H / 2 + 25);
+      ctx.fillText(`距离: ${s.distanceM.toFixed(1)} m  |  摇晃控制器 / 按空格键重新开始`, W / 2, H / 2 + 25);
     }
   }
 
@@ -1133,12 +2006,18 @@ function startJump() {
   const PLATFORM_H = 40;
   const PLAYER_SIZE = 30;
   const GRAVITY = 0.5;
-  const MAX_POWER = 18;
-  const CHARGE_SPEED = 0.35;
+  const WHEEL_DIAMETER_CM = 5.6; // 电机轮子直径 56mm。
+  const WHEEL_CIRCUMFERENCE_CM = Math.PI * WHEEL_DIAMETER_CM;
+  const PX_PER_CM = 16;
+  const JUMP_VY = -12;
+  const DISTANCE_OPTIONS_CM = [9, 10, 11, 12, 13, 14, 15, 16];
+  const MOTOR_MOVE_EPS_DEG = 1.5;
+  const MOTOR_STOP_DELAY_MS = 240;
+  const MIN_JUMP_CM = 0.2;
 
   gameState = {
     keys: gameState.keys || {},
-    phase: 'start', // 'start' | 'playing' | 'charging' | 'jumping' | 'landing' | 'falling' | 'gameover'
+    phase: 'start', // 'start' | 'playing' | 'jumping' | 'landing' | 'falling' | 'gameover'
     score: 0,
     combo: 0,
     bestCombo: 0,
@@ -1146,9 +2025,14 @@ function startJump() {
     platforms: [],
     // 玩家
     player: { x: 0, y: 0, vy: 0, vx: 0, squash: 1 },
-    // 蓄力
-    power: 0,
-    charging: false,
+    // 电机测距
+    motorRawDeg: 0,
+    motorAnchorDeg: null,
+    lastMotorDeg: null,
+    lastMotorMoveAt: 0,
+    hasMotorMoved: false,
+    measuredCm: 0,
+    lastJumpGapCm: 0,
     // 相机
     cameraX: 0,
     targetCameraX: 0,
@@ -1159,6 +2043,7 @@ function startJump() {
     // 开始界面动画
     startBounce: 0,
   };
+  const jumpState = gameState;
 
   // 初始化第一个平台
   const firstW = 100;
@@ -1180,14 +2065,16 @@ function startJump() {
   function generateNextPlatform() {
     const s = gameState;
     const last = s.platforms[s.platforms.length - 1];
-    const gap = 80 + Math.random() * 120;
-    const w = 50 + Math.random() * 70;
+    const gapCm = DISTANCE_OPTIONS_CM[Math.floor(Math.random() * DISTANCE_OPTIONS_CM.length)];
+    const gap = gapCm * PX_PER_CM;
+    const w = 60 + Math.random() * 50;
     const colors = ['#22d3ee', '#34d399', '#a78bfa', '#f472b6', '#fbbf24', '#f87171'];
     const color = colors[Math.floor(Math.random() * colors.length)];
     s.platforms.push({
       x: last.x + last.w + gap,
       y: GROUND_Y,
       w: w,
+      gapCm,
       color: color,
     });
   }
@@ -1206,65 +2093,138 @@ function startJump() {
     }
   }
 
-  // 蓄力开始
-  function startCharge() {
+  function jumpSendHardware(msg) {
+    if (typeof writeToPort === 'function' && serialPorts.port1 && serialPorts.port1.isConnected) {
+      writeToPort('port1', `${msg}\n`).catch(() => {});
+    }
+  }
+
+  function motorDegToCm(deg) {
+    return Math.abs(deg) / 360 * WHEEL_CIRCUMFERENCE_CM;
+  }
+
+  function resetMotorMeasure(rawDeg = gameState.motorRawDeg) {
+    const s = gameState;
+    s.motorAnchorDeg = rawDeg;
+    s.lastMotorDeg = rawDeg;
+    s.lastMotorMoveAt = performance.now();
+    s.hasMotorMoved = false;
+    s.measuredCm = 0;
+  }
+
+  function getCurrentTargetPlatform() {
+    const s = gameState;
+    return s.platforms[s.currentPlatformIndex + 1] || null;
+  }
+
+  function getCurrentPlatform() {
+    const s = gameState;
+    return s.platforms[s.currentPlatformIndex] || null;
+  }
+
+  function beginPlaying() {
+    const s = gameState;
+    s.phase = 'playing';
+    s.motorAnchorDeg = null;
+    s.lastMotorDeg = null;
+    s.lastMotorMoveAt = 0;
+    s.hasMotorMoved = false;
+    s.measuredCm = 0;
+    jumpSendHardware('RESET');
+  }
+
+  function restartJumpGame() {
+    if (gameAnimationId) {
+      cancelAnimationFrame(gameAnimationId);
+      gameAnimationId = null;
+    }
+    if (gameState._jumpCleanup) {
+      gameState._jumpCleanup();
+    }
+    window._jumpHandleShake = null;
+    window._jumpHandleMotorRawDeg = null;
+    startJump();
+  }
+
+  function releaseJump(measuredGapCm = gameState.measuredCm) {
     const s = gameState;
     if (s.phase !== 'playing') return;
-    s.phase = 'charging';
-    s.power = 0;
-    s.charging = true;
-  }
+    const current = getCurrentPlatform();
+    const target = getCurrentTargetPlatform();
+    if (!current || !target) return;
 
-  // 松开跳跃
-  function releaseJump() {
-    const s = gameState;
-    if (s.phase !== 'charging') return;
+    const gapCm = Math.max(0, measuredGapCm);
+    if (gapCm < 1) return;
     s.phase = 'jumping';
-    s.charging = false;
+    s.lastJumpGapCm = gapCm;
 
-    const power = Math.min(s.power, MAX_POWER);
-    s.player.vy = -(power * 0.7 + 5);
-    s.player.vx = power * 0.55 + 2;
+    const horizontalPx = current.w / 2 + gapCm * PX_PER_CM + target.w / 2;
+    const flightFrames = Math.max(1, (-2 * JUMP_VY) / GRAVITY);
+    s.player.vy = JUMP_VY;
+    s.player.vx = horizontalPx / flightFrames;
     s.player.squash = 1;
   }
+
+  function updateMotorMeasure(rawDeg) {
+    const s = gameState;
+    const prevDeg = s.lastMotorDeg;
+    s.motorRawDeg = rawDeg;
+    if (s.motorAnchorDeg === null) {
+      resetMotorMeasure(rawDeg);
+      return;
+    }
+    s.lastMotorDeg = rawDeg;
+    s.measuredCm = motorDegToCm(rawDeg - s.motorAnchorDeg);
+
+    if (prevDeg !== null && Math.abs(rawDeg - prevDeg) >= MOTOR_MOVE_EPS_DEG) {
+      s.lastMotorMoveAt = performance.now();
+      s.hasMotorMoved = true;
+    }
+  }
+
+  window._jumpHandleShake = function(source) {
+    if (currentGame !== 'jump' || source !== 'port1') return;
+    if (gameState.phase === 'start') {
+      beginPlaying();
+    } else if (gameState.phase === 'gameover') {
+      restartJumpGame();
+    }
+  };
 
   // 键盘 / 鼠标 / 触摸事件
   function jumpKeyDown(e) {
     if (e.key === ' ' || e.key === 'Enter') {
       e.preventDefault();
       if (gameState.phase === 'start') {
-        gameState.phase = 'playing';
+        beginPlaying();
         return;
       }
       if (gameState.phase === 'gameover') {
-        startJump(); // 重新开始
+        restartJumpGame();
         return;
       }
-      startCharge();
+      const target = getCurrentTargetPlatform();
+      if (target) releaseJump(target.gapCm);
     }
   }
 
   function jumpKeyUp(e) {
     if (e.key === ' ' || e.key === 'Enter') {
       e.preventDefault();
-      releaseJump();
     }
   }
 
   function jumpMouseDown(e) {
     if (gameState.phase === 'start') {
-      gameState.phase = 'playing';
+      beginPlaying();
       return;
     }
     if (gameState.phase === 'gameover') {
-      startJump();
+      restartJumpGame();
       return;
     }
-    startCharge();
-  }
-
-  function jumpMouseUp(e) {
-    releaseJump();
+    const target = getCurrentTargetPlatform();
+    if (target) releaseJump(target.gapCm);
   }
 
   // 替换通用键盘处理，使用游戏专用的
@@ -1273,18 +2233,19 @@ function startJump() {
   document.addEventListener('keydown', jumpKeyDown);
   document.addEventListener('keyup', jumpKeyUp);
   gameCanvas.addEventListener('mousedown', jumpMouseDown);
-  gameCanvas.addEventListener('mouseup', jumpMouseUp);
   gameCanvas.addEventListener('touchstart', jumpMouseDown);
-  gameCanvas.addEventListener('touchend', jumpMouseUp);
 
   // 存储清理函数
   gameState._jumpCleanup = () => {
     document.removeEventListener('keydown', jumpKeyDown);
     document.removeEventListener('keyup', jumpKeyUp);
     gameCanvas.removeEventListener('mousedown', jumpMouseDown);
-    gameCanvas.removeEventListener('mouseup', jumpMouseUp);
     gameCanvas.removeEventListener('touchstart', jumpMouseDown);
-    gameCanvas.removeEventListener('touchend', jumpMouseUp);
+  };
+
+  window._jumpHandleMotorRawDeg = function(rawDeg, source) {
+    if (currentGame !== 'jump' || source !== 'port1') return;
+    updateMotorMeasure(rawDeg);
   };
 
   function update() {
@@ -1297,11 +2258,13 @@ function startJump() {
       return;
     }
 
-    // 蓄力
-    if (s.phase === 'charging') {
-      s.power = Math.min(s.power + CHARGE_SPEED, MAX_POWER);
-      // 蓄力时玩家压缩
-      s.player.squash = 1 - (s.power / MAX_POWER) * 0.35;
+    if (s.phase === 'playing') {
+      const target = getCurrentTargetPlatform();
+      const ratio = target ? Math.min(s.measuredCm / target.gapCm, 1) : 0;
+      s.player.squash = 1 - ratio * 0.25;
+      if (s.hasMotorMoved && s.measuredCm >= MIN_JUMP_CM && performance.now() - s.lastMotorMoveAt >= MOTOR_STOP_DELAY_MS) {
+        releaseJump(s.measuredCm);
+      }
     }
 
     // 跳跃中
@@ -1370,6 +2333,7 @@ function startJump() {
       if (s.landingTimer <= 0) {
         s.player.squash = 1;
         s.phase = 'playing';
+        resetMotorMeasure();
       }
     }
 
@@ -1431,6 +2395,31 @@ function startJump() {
       ctx.fillStyle = 'rgba(255,255,255,0.15)';
       ctx.fillRect(plat.x, plat.y, plat.w, 3);
 
+      if (i > 0 && plat.gapCm) {
+        const prev = s.platforms[i - 1];
+        const lineStart = prev.x + prev.w;
+        const lineEnd = plat.x;
+        const midX = (lineStart + lineEnd) / 2;
+        const lineY = plat.y - 34;
+        ctx.strokeStyle = i === s.currentPlatformIndex + 1 ? '#fbbf24' : 'rgba(255,255,255,0.25)';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(lineStart, lineY);
+        ctx.lineTo(lineEnd, lineY);
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(lineStart, lineY - 5);
+        ctx.lineTo(lineStart, lineY + 5);
+        ctx.moveTo(lineEnd, lineY - 5);
+        ctx.lineTo(lineEnd, lineY + 5);
+        ctx.stroke();
+        ctx.fillStyle = i === s.currentPlatformIndex + 1 ? '#fbbf24' : 'rgba(255,255,255,0.55)';
+        ctx.font = 'bold 14px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'bottom';
+        ctx.fillText(`${plat.gapCm} cm`, midX, lineY - 6);
+      }
+
       // 下一个目标平台标记
       if (i === s.currentPlatformIndex + 1 && s.phase === 'playing') {
         const centerX = plat.x + plat.w / 2;
@@ -1454,13 +2443,15 @@ function startJump() {
     });
     ctx.globalAlpha = 1;
 
-    // 绘制蓄力条（玩家下方）
-    if (s.phase === 'charging') {
-      const barW = 50;
+    // 绘制电机测距进度（玩家下方）
+    if (s.phase === 'playing') {
+      const target = getCurrentTargetPlatform();
+      const targetCm = target ? target.gapCm : 0;
+      const ratio = targetCm ? Math.min(s.measuredCm / targetCm, 1) : 0;
+      const barW = 68;
       const barH = 6;
       const barX = p.x - barW / 2;
       const barY = p.y + PLAYER_SIZE + 15;
-      const ratio = s.power / MAX_POWER;
 
       ctx.fillStyle = 'rgba(0,0,0,0.4)';
       ctx.fillRect(barX - 1, barY - 1, barW + 2, barH + 2);
@@ -1476,6 +2467,12 @@ function startJump() {
       ctx.shadowBlur = 6;
       ctx.fillRect(barX, barY, barW * ratio, barH);
       ctx.shadowBlur = 0;
+
+      ctx.fillStyle = 'rgba(255,255,255,0.75)';
+      ctx.font = '12px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'top';
+      ctx.fillText(`${s.measuredCm.toFixed(1)} / ${targetCm || 0} cm`, p.x, barY + 10);
     }
 
     // 绘制玩家（方块角色）
@@ -1552,7 +2549,7 @@ function startJump() {
 
       ctx.fillStyle = 'rgba(255,255,255,0.4)';
       ctx.font = '16px sans-serif';
-      ctx.fillText('按空格键 / 点击 重新开始', W / 2, H / 2 + 70);
+      ctx.fillText('摇晃控制器 / 按空格键 / 点击 重新开始', W / 2, H / 2 + 70);
     }
   }
 
@@ -1601,18 +2598,18 @@ function startJump() {
     ctx.fillStyle = '#fff';
     ctx.font = 'bold 48px sans-serif';
     ctx.textAlign = 'center';
-    ctx.fillText('跳 一 跳', W / 2, titleY + 10);
+    ctx.fillText('数字测量尺', W / 2, titleY + 10);
 
     // 副标题
     ctx.fillStyle = 'rgba(255,255,255,0.4)';
     ctx.font = '18px sans-serif';
-    ctx.fillText('按住蓄力 · 松开跳跃 · 精准落点拿高分', W / 2, titleY + 50);
+    ctx.fillText('转动电机测量厘米距离 · 停止转动后自动跳跃', W / 2, titleY + 50);
 
     // 操作提示（闪烁）
     const blink = Math.sin(s.frame * 0.06) * 0.3 + 0.5;
     ctx.fillStyle = `rgba(255,255,255,${blink})`;
     ctx.font = '20px sans-serif';
-    ctx.fillText('按空格键 / 点击屏幕 开始游戏', W / 2, titleY + 110);
+    ctx.fillText('摇晃控制器开始游戏', W / 2, titleY + 110);
 
     // 操作说明框
     const boxY = titleY + 140;
@@ -1624,11 +2621,12 @@ function startJump() {
 
     ctx.fillStyle = 'rgba(255,255,255,0.3)';
     ctx.font = '14px sans-serif';
-    ctx.fillText('🎮 空格/点击: 按住蓄力，松开跳跃', W / 2, boxY + 25);
-    ctx.fillText('🎯 落在平台中心可获得 2 分', W / 2, boxY + 48);
+    ctx.fillText('轮径 56mm：角度 × 周长换算为 cm', W / 2, boxY + 25);
+    ctx.fillText('空格/点击可模拟一次精准跳跃', W / 2, boxY + 48);
   }
 
   function loop() {
+    if (currentGame !== 'jump' || gameState !== jumpState) return;
     update();
     draw();
     gameAnimationId = requestAnimationFrame(loop);
@@ -1636,14 +2634,26 @@ function startJump() {
   loop();
 }
 
-// ========== 串口数据解析器（双端口 + 玩家ID前缀支持） ==========
+// ========== 串口数据解析器（单控制器 + 兼容玩家ID前缀） ==========
+// 硬件输入收敛：控制器本体负责 JOY / RAW_JOY / BTN / GYRO / SHAKE，一个电机负责 DEGREE / ANGLE。
 // 解析星瀚固定手柄串口数据协议
 // 支持两种数据格式：
-//   1. 带玩家前缀: "P1|JOY:UP", "P2|BTN:PRESSED" （优先使用前缀确定玩家）
-//   2. 无前缀:     "JOY:UP", "BTN:PRESSED"       （使用 portId 参数确定玩家）
-// portId: 'port1' | 'port2'，物理端口标识（当数据无前缀时作为 fallback）
+//   1. 带玩家前缀: "P1|JOY:UP", "P2|BTN:PRESSED" （兼容旧固件，统一收敛为控制器）
+//   2. 无前缀:     "JOY:UP", "BTN:PRESSED"
+// portId: 当前保留为 'port1'。
+const GYRO_STATE_DIRECTION_MAP = {
+  向前倾斜: 'UP',
+  向后倾斜: 'DOWN',
+  向左倾斜: 'LEFT',
+  向右倾斜: 'RIGHT',
+};
+
+function gyroStateToDirection(state) {
+  return GYRO_STATE_DIRECTION_MAP[String(state || '').trim()] || null;
+}
+
 function handleSerialData(data, portId) {
-  const msg = data.trim();
+  const msg = normalizeIncomingTextLine(data);
   if (!msg) return;
 
   // ========== 第一步：解析玩家ID前缀 ==========
@@ -1657,16 +2667,18 @@ function handleSerialData(data, portId) {
     const prefix = msg.substring(0, pipeIndex).trim().toUpperCase();
     const payload = msg.substring(pipeIndex + 1).trim();
 
-    // 识别玩家前缀: P1 → port1, P2 → port2
+    // 兼容旧玩家前缀：P1 / P2 都进入同一个控制器输入源。
     if (prefix === 'P1') {
       source = 'port1';
       command = payload;
     } else if (prefix === 'P2') {
-      source = 'port2';
+      source = 'port1';
       command = payload;
     }
     // 不再对每条消息都记录调试日志（高频消息会产生大量垃圾）
   }
+  command = normalizeIncomingTextLine(command);
+  source = normalizeSingleControllerSource(source);
 
   // ========== 第二步：记录原始数据到调试缓冲区 ==========
   const dbg = window._serialDebug[source];
@@ -1732,6 +2744,41 @@ function handleSerialData(data, portId) {
     return;
   }
 
+  // 钓鱼演示 V2 硬件协议（与 software_V2.py 一致）：ANGLE|累计角；也兼容单电机 DEGREE:
+  if (upper.startsWith('ANGLE|')) {
+    const bar = command.indexOf('|');
+    const val = bar >= 0 ? parseFloat(command.substring(bar + 1)) : NaN;
+    if (!isNaN(val)) {
+      if (currentGame === 'pong' && window._pongHandleMotorRawDeg) {
+        window._pongHandleMotorRawDeg(val, source);
+      } else if (currentGame === 'dino' && window._dinoHandleMotorRawDeg) {
+        window._dinoHandleMotorRawDeg(val, source);
+      } else if (currentGame === 'jump' && window._jumpHandleMotorRawDeg) {
+        window._jumpHandleMotorRawDeg(val, source);
+      } else if (currentGame === 'fishing' && window._fishingHandleMotorRawDeg) {
+        window._fishingHandleMotorRawDeg(val, source);
+      }
+    }
+    return;
+  }
+  if (upper.startsWith('GYRO|')) {
+    const bar = command.indexOf('|');
+    const rest = bar >= 0 ? command.substring(bar + 1).trim() : '';
+    if (rest === '摇晃') {
+      if (dbg) dbg.lastParsed = `[${source}] GYRO → 摇晃`;
+      onSerialShake(source);
+    } else {
+      const dir = gyroStateToDirection(rest);
+      if (dir) {
+        if (dbg) dbg.lastParsed = `[${source}] GYRO → ${rest} / ${dir}`;
+        onSerialDirection(dir, source);
+      } else if (dbg) {
+        dbg.lastParsed = `[${source}] GYRO → ${rest || 'EMPTY'}`;
+      }
+    }
+    return;
+  }
+
   // MOTOR 旋转状态
   if (upper.startsWith('MOTOR:')) {
     const state = upper.substring(6).trim();
@@ -1787,7 +2834,7 @@ function handleSerialData(data, portId) {
   if (dbg) dbg.lastParsed = `[${source}] UNKNOWN: ${command.substring(0, 20)}`;
 }
 
-// 串口事件分发 - 方向（source: 'port1' | 'port2'）
+// 串口事件分发 - 方向（source: 'port1'）
 function onSerialDirection(dir, source) {
   // 分发给当前活跃的游戏
   if (currentGame === 'gomoku') {
@@ -1797,14 +2844,14 @@ function onSerialDirection(dir, source) {
       _dbgLog(`WARN: gomoku active but gameState.gomoku is null! source=${source} dir=${dir}`);
     }
   } else if (currentGame === 'pong') {
-    // Pong: port1 控制左挡板（UP/DOWN），port2 可扩展右挡板
-    if (source === 'port1') {
-      if (dir === 'UP') { gameState.keys = gameState.keys || {}; gameState.keys['ArrowUp'] = true; setTimeout(() => { gameState.keys['ArrowUp'] = false; }, 150); }
-      if (dir === 'DOWN') { gameState.keys = gameState.keys || {}; gameState.keys['ArrowDown'] = true; setTimeout(() => { gameState.keys['ArrowDown'] = false; }, 150); }
+    if (window._pongHandleDirection) {
+      window._pongHandleDirection(dir, source);
     }
   } else if (currentGame === 'snake') {
     // Snake: 仅 port1 控制
-    if (source === 'port1') {
+    if (window._snakeHandleDirection) {
+      window._snakeHandleDirection(dir, source);
+    } else if (source === 'port1') {
       gameState.keys = gameState.keys || {};
       const keyMap = { UP: 'ArrowUp', DOWN: 'ArrowDown', LEFT: 'ArrowLeft', RIGHT: 'ArrowRight' };
       if (keyMap[dir]) { gameState.keys[keyMap[dir]] = true; setTimeout(() => { gameState.keys[keyMap[dir]] = false; }, 200); }
@@ -1828,7 +2875,7 @@ function onSerialDirection(dir, source) {
   }
 }
 
-// 串口事件分发 - 按键（source: 'port1' | 'port2'）
+// 串口事件分发 - 按键（source: 'port1'）
 function onSerialButton(pressed, source) {
   if (currentGame === 'gomoku') {
     if (gameState.gomoku) {
@@ -1836,23 +2883,22 @@ function onSerialButton(pressed, source) {
         gomokuHandlePlace(source);
       }
     }
-  } else if (currentGame === 'dino' && pressed && source === 'port1') {
-    if (gameState.dino && !gameState.dino.jumping) {
-      gameState.dino.vy = -13;
-      gameState.dino.jumping = true;
-    }
-    if (gameState.dino && gameState.dino.gameOver) {
-      startDino();
-    }
   } else if (currentGame === 'tank') {
     if (gameState.tank && pressed) {
       tankHandleButton(source);
     }
   } else if (currentGame === 'jump' && source === 'port1') {
+    if (gameState.phase === 'start' || gameState.phase === 'gameover') {
+      return;
+    }
     if (pressed) {
       document.dispatchEvent(new KeyboardEvent('keydown', { key: ' ' }));
     } else {
       document.dispatchEvent(new KeyboardEvent('keyup', { key: ' ' }));
+    }
+  } else if (currentGame === 'pong') {
+    if (window._pongHandleButton) {
+      window._pongHandleButton(pressed, source);
     }
   } else if (currentGame === 'fishing') {
     if (window._fishingHandleButton) {
@@ -1871,6 +2917,9 @@ function onSerialButton(pressed, source) {
 
 // 串口事件分发 - 原始摇杆坐标
 function onSerialRawJoy(x, y, source) {
+  if (currentGame === 'pong' && window._pongHandleRawJoy) {
+    window._pongHandleRawJoy(x, y, source);
+  }
   if (currentGame === 'fishing' && window._fishingHandleRawJoy) {
     window._fishingHandleRawJoy(x, y, source);
   }
@@ -1881,7 +2930,13 @@ function onSerialRawJoy(x, y, source) {
 
 // 串口事件分发 - 电机角度
 function onSerialDegree(value, source) {
-  if (currentGame === 'fishing' && window._fishingHandleDegree) {
+  if (currentGame === 'pong' && window._pongHandleMotorRawDeg) {
+    window._pongHandleMotorRawDeg(value, source);
+  } else if (currentGame === 'dino' && window._dinoHandleMotorRawDeg) {
+    window._dinoHandleMotorRawDeg(value, source);
+  } else if (currentGame === 'jump' && window._jumpHandleMotorRawDeg) {
+    window._jumpHandleMotorRawDeg(value, source);
+  } else if (currentGame === 'fishing' && window._fishingHandleDegree) {
     window._fishingHandleDegree(value, source);
   }
 }
@@ -1895,6 +2950,23 @@ function onSerialMotor(state, source) {
 function onSerialGyro(pitch, roll, yaw, source) {
   if (currentGame === 'gyro' && window._gyroHandleGyro) {
     window._gyroHandleGyro(pitch, roll, yaw, source);
+  }
+}
+
+// 串口事件分发 - 陀螺仪摇晃（统一开始/继续入口）
+function onSerialShake(source) {
+  if (source !== 'port1') return;
+
+  if (currentGame === 'pong' && window._pongHandleShake) {
+    window._pongHandleShake(source);
+  } else if (currentGame === 'snake' && window._snakeHandleShake) {
+    window._snakeHandleShake(source);
+  } else if (currentGame === 'dino' && window._dinoHandleShake) {
+    window._dinoHandleShake(source);
+  } else if (currentGame === 'jump' && window._jumpHandleShake) {
+    window._jumpHandleShake(source);
+  } else if (currentGame === 'fishing' && window._fishingHandleGyroShake) {
+    window._fishingHandleGyroShake(source);
   }
 }
 
@@ -2321,8 +3393,8 @@ function startGomoku() {
 
     // 模式选项
     const options = [
-      { label: '⚔️  人机对战 (PVE)', desc: '手柄/方向键移动 · BTN/回车落子 · AI对手' },
-      { label: '👥  双人对战 (PVP)', desc: '玩家1: 手柄1/方向键  ·  玩家2: 手柄2/WASD+空格' },
+      { label: '⚔️  人机对战 (PVE)', desc: '控制器/方向键移动 · BTN/回车落子 · AI对手' },
+      { label: '👥  双人对战 (PVP)', desc: '玩家1: 控制器/方向键  ·  玩家2: WASD+空格' },
     ];
 
     const startY = 270;
@@ -2394,14 +3466,11 @@ function startGomoku() {
     ctx.fillText('↑ ↓ 选择模式  ·  回车/空格/BTN 确认', W / 2, 470);
 
     // 菜单页串口连接状态
-    const p1c = serialPorts.port1.isConnected;
-    const p2c = serialPorts.port2.isConnected;
+    const controllerConnected = serialPorts.port1.isConnected;
     ctx.font = '12px monospace';
     ctx.textAlign = 'center';
-    ctx.fillStyle = p1c ? '#22d3ee' : 'rgba(255,255,255,0.25)';
-    ctx.fillText(`手柄1: ${p1c ? '✅ 已连接' : '❌ 未连接'}`, W / 2 - 90, H - 30);
-    ctx.fillStyle = p2c ? '#f472b6' : 'rgba(255,255,255,0.25)';
-    ctx.fillText(`手柄2: ${p2c ? '✅ 已连接' : '❌ 未连接'}`, W / 2 + 90, H - 30);
+    ctx.fillStyle = controllerConnected ? '#22d3ee' : 'rgba(255,255,255,0.25)';
+    ctx.fillText(`控制器: ${controllerConnected ? '已连接' : '未连接'}`, W / 2, H - 30);
   }
 
   // 绘制棋盘
@@ -2651,7 +3720,7 @@ function startGomoku() {
     ctx.fillStyle = g.currentPlayer === 1 ? '#22d3ee' : '#f472b6';
     ctx.font = '13px sans-serif';
     ctx.fillText(
-      g.currentPlayer === 1 ? (g.mode === 'pve' ? '黑 (你)' : '黑 (P1)') : (g.mode === 'pve' ? '白 (AI)' : '白 (P2)'),
+      g.currentPlayer === 1 ? (g.mode === 'pve' ? '黑 (你)' : '黑 (控制器)') : (g.mode === 'pve' ? '白 (AI)' : '白 (键盘)'),
       panelX + indicatorR * 2 + 8, indicatorY + 4
     );
 
@@ -2667,11 +3736,11 @@ function startGomoku() {
     ctx.font = '11px sans-serif';
     ctx.textAlign = 'left';
     if (g.mode === 'pve') {
-      ctx.fillText('🎮 手柄1/方向键: 移动', panelX, hintY);
+      ctx.fillText('🎮 控制器/方向键: 移动', panelX, hintY);
       ctx.fillText('⏎ BTN/回车: 落子', panelX, hintY + 16);
     } else {
-      ctx.fillText('P1: 手柄1/方向键 + BTN/回车', panelX, hintY);
-      ctx.fillText('P2: 手柄2/WASD + 空格', panelX, hintY + 16);
+      ctx.fillText('玩家1: 控制器/方向键 + BTN/回车', panelX, hintY);
+      ctx.fillText('玩家2: WASD + 空格', panelX, hintY + 16);
     }
 
     // 消息提示
@@ -2735,8 +3804,8 @@ function startGomoku() {
   loop();
 }
 
-// 五子棋串口方向控制（双端口支持）
-// source: 'port1' = 玩家1手柄, 'port2' = 玩家2手柄
+// 五子棋串口方向控制（单控制器输入，键盘仍可作为二号玩家）
+// source: 'port1' = 单控制器；玩家2仍通过键盘控制。
 function gomokuHandleDirection(dir, source) {
   const g = gameState.gomoku;
   if (!g) { _dbgLog(`gomokuDir: BLOCKED - g is null`); return; }
@@ -2778,7 +3847,7 @@ function gomokuHandleDirection(dir, source) {
     return;
   }
 
-  // PVP 模式：port1 = 玩家1(黑)光标, port2 = 玩家2(白)光标
+  // PVP 模式：控制器控制玩家1(黑)，玩家2(白)使用键盘。
   // 双方可以随时移动自己的光标，不受回合限制
   if (g.mode === 'pvp') {
     if (source === 'port1') {
@@ -2803,7 +3872,7 @@ function gomokuHandleDirection(dir, source) {
   }
 }
 
-// 五子棋串口落子控制（双端口支持）
+// 五子棋串口落子控制（单控制器输入，键盘仍可作为二号玩家）
 function gomokuHandlePlace(source) {
   const g = gameState.gomoku;
   if (!g) { _dbgLog(`gomokuPlace: BLOCKED - g is null`); return; }
@@ -2816,7 +3885,7 @@ function gomokuHandlePlace(source) {
     g.mode = g.menuIndex === 0 ? 'pve' : 'pvp';
     g.currentPlayer = 1;
     if (g.mode === 'pvp') {
-      g.message = '双人对战 - 黑方(P1) vs 白方(P2)';
+      g.message = '双人对战 - 黑方(控制器) vs 白方(键盘)';
     } else {
       g.message = '人机对战 - 你执黑先行';
     }
@@ -4061,8 +5130,8 @@ function startTankBattle() {
 
     // 菜单选项
     const options = [
-      { label: '1 PLAYER', desc: '单人模式 · 方向键/手柄1移动 · 空格/BTN射击' },
-      { label: '2 PLAYERS', desc: '双人模式 · P1方向键 P2:WASD · 支持双手柄' },
+      { label: '1 PLAYER', desc: '单人模式 · 方向键/控制器移动 · 空格/BTN射击' },
+      { label: '2 PLAYERS', desc: '双人模式 · 玩家1控制器/方向键 · 玩家2 WASD' },
       { label: `STAGE ${t.levelIndex + 1}`, desc: '← → 选择关卡' },
     ];
 
@@ -4581,1783 +5650,592 @@ function tankHandleButton(source) {
   }
 }
 
-// ========== 🎣 钓鱼达人 ==========
+// ========== 🎣 钓鱼达人（演示 V2 迁移：software_V2.py 流程 + 素材） ==========
+const FISHING_V2_BASE = './assets/fishing-v2/';
+const FISHING_V2_FISH_TYPES = ['武昌鱼', '白条', '草鱼', '鲤鱼', '麦穗鱼', '黄辣丁'];
+const FISHING_V2_FISH_WEIGHTS = {
+  武昌鱼: 0.6, 白条: 0.03, 草鱼: 1.8, 鲤鱼: 1.0, 麦穗鱼: 0.01, 黄辣丁: 0.1,
+};
 
-// === 鱼类数据库（50种 + 2彩蛋 = 52种） ===
-const FISH_DB = [
-  // Common (20种) - 权重大 — shape: 鱼的体型, pattern: 花纹, fins: 鱼鳍样式, tail: 尾巴, eye: 眼睛
-  { id:1, name:'鲫鱼', rarity:'Common', weight:100, basePull:8, color:'#c0c0c0', color2:'#e8e8e8', shape:'oval', pattern:'scales', fins:'small', tail:'fan', bodyW:1.0, bodyH:0.55 },
-  { id:2, name:'草鱼', rarity:'Common', weight:95, basePull:10, color:'#5a8a5a', color2:'#7ec87e', shape:'long', pattern:'scales', fins:'medium', tail:'fork', bodyW:1.3, bodyH:0.45 },
-  { id:3, name:'鲤鱼', rarity:'Common', weight:90, basePull:12, color:'#d4841f', color2:'#e8a04c', shape:'oval', pattern:'scales', fins:'medium', tail:'fan', bodyW:1.1, bodyH:0.6, whiskers:true },
-  { id:4, name:'鲈鱼', rarity:'Common', weight:88, basePull:11, color:'#5a8b5a', color2:'#8fbc8f', shape:'oval', pattern:'stripes', fins:'spiny', tail:'fork', bodyW:1.05, bodyH:0.5 },
-  { id:5, name:'罗非鱼', rarity:'Common', weight:85, basePull:9, color:'#808080', color2:'#b0b0b0', shape:'oval', pattern:'stripes', fins:'spiny', tail:'fan', bodyW:1.0, bodyH:0.6 },
-  { id:6, name:'鲶鱼', rarity:'Common', weight:82, basePull:13, color:'#4a4a4a', color2:'#6b6b6b', shape:'flat', pattern:'smooth', fins:'small', tail:'round', bodyW:1.3, bodyH:0.4, whiskers:true },
-  { id:7, name:'鳊鱼', rarity:'Common', weight:80, basePull:8, color:'#7a7a7a', color2:'#a8a8a8', shape:'tall', pattern:'scales', fins:'small', tail:'fork', bodyW:0.85, bodyH:0.7 },
-  { id:8, name:'白条', rarity:'Common', weight:95, basePull:5, color:'#c8c8c8', color2:'#e0e0e0', shape:'slim', pattern:'none', fins:'tiny', tail:'fork', bodyW:1.1, bodyH:0.3 },
-  { id:9, name:'黄颡鱼', rarity:'Common', weight:78, basePull:10, color:'#b88a17', color2:'#d4a017', shape:'flat', pattern:'spots', fins:'spiny', tail:'round', bodyW:1.0, bodyH:0.4, whiskers:true },
-  { id:10, name:'泥鳅', rarity:'Common', weight:75, basePull:6, color:'#6b5335', color2:'#8b7355', shape:'eel', pattern:'spots', fins:'tiny', tail:'round', bodyW:1.6, bodyH:0.22 },
-  { id:11, name:'翘嘴', rarity:'Common', weight:72, basePull:14, color:'#a0a0a0', color2:'#c9c9c9', shape:'long', pattern:'none', fins:'medium', tail:'fork', bodyW:1.25, bodyH:0.38 },
-  { id:12, name:'鳙鱼', rarity:'Common', weight:70, basePull:15, color:'#666', color2:'#999', shape:'bighead', pattern:'spots', fins:'medium', tail:'fork', bodyW:1.1, bodyH:0.6 },
-  { id:13, name:'鲢鱼', rarity:'Common', weight:70, basePull:14, color:'#888', color2:'#aaa', shape:'bighead', pattern:'none', fins:'medium', tail:'fork', bodyW:1.1, bodyH:0.58 },
-  { id:14, name:'马口鱼', rarity:'Common', weight:68, basePull:7, color:'#5999c0', color2:'#89cff0', shape:'slim', pattern:'stripes', fins:'small', tail:'fork', bodyW:1.0, bodyH:0.32 },
-  { id:15, name:'麦穗鱼', rarity:'Common', weight:90, basePull:4, color:'#b2948c', color2:'#d2b48c', shape:'slim', pattern:'none', fins:'tiny', tail:'fork', bodyW:0.8, bodyH:0.28 },
-  { id:16, name:'棒花鱼', rarity:'Common', weight:85, basePull:5, color:'#9c6f6f', color2:'#bc8f8f', shape:'slim', pattern:'spots', fins:'tiny', tail:'round', bodyW:0.9, bodyH:0.3 },
-  { id:17, name:'沙塘鳢', rarity:'Common', weight:65, basePull:9, color:'#4b2216', color2:'#6b4226', shape:'flat', pattern:'spots', fins:'small', tail:'round', bodyW:1.0, bodyH:0.45 },
-  { id:18, name:'鳑鲏', rarity:'Common', weight:88, basePull:3, color:'#e06666', color2:'#ff9999', shape:'tall', pattern:'scales', fins:'small', tail:'fan', bodyW:0.7, bodyH:0.65, rainbow:true },
-  { id:19, name:'虾虎鱼', rarity:'Common', weight:80, basePull:4, color:'#a48862', color2:'#c4a882', shape:'flat', pattern:'spots', fins:'medium', tail:'round', bodyW:0.9, bodyH:0.35 },
-  { id:20, name:'青鳉', rarity:'Common', weight:82, basePull:3, color:'#80b2bb', color2:'#a0d2db', shape:'slim', pattern:'none', fins:'tiny', tail:'fork', bodyW:0.7, bodyH:0.25 },
-  // Rare (15种)
-  { id:21, name:'黑鱼', rarity:'Rare', weight:30, basePull:20, color:'#1a3333', color2:'#2f4f4f', shape:'long', pattern:'spots', fins:'medium', tail:'round', bodyW:1.3, bodyH:0.4 },
-  { id:22, name:'鳜鱼', rarity:'Rare', weight:28, basePull:22, color:'#3a5b1f', color2:'#556b2f', shape:'oval', pattern:'spots', fins:'spiny', tail:'fan', bodyW:1.1, bodyH:0.6 },
-  { id:23, name:'石斑鱼', rarity:'Rare', weight:25, basePull:25, color:'#6b3413', color2:'#8b4513', shape:'oval', pattern:'spots', fins:'spiny', tail:'fan', bodyW:1.15, bodyH:0.55 },
-  { id:24, name:'鲑鱼', rarity:'Rare', weight:22, basePull:24, color:'#d86052', color2:'#fa8072', shape:'long', pattern:'spots', fins:'medium', tail:'fork', bodyW:1.3, bodyH:0.42 },
-  { id:25, name:'虹鳟', rarity:'Rare', weight:20, basePull:23, color:'#dd4994', color2:'#ff69b4', shape:'long', pattern:'rainbow', fins:'medium', tail:'fork', bodyW:1.25, bodyH:0.4, rainbow:true },
-  { id:26, name:'大口鲈', rarity:'Rare', weight:20, basePull:26, color:'#1c8351', color2:'#3cb371', shape:'oval', pattern:'stripes', fins:'spiny', tail:'fork', bodyW:1.15, bodyH:0.55 },
-  { id:27, name:'红尾鲶', rarity:'Rare', weight:18, basePull:28, color:'#8d3c3c', color2:'#cd5c5c', shape:'flat', pattern:'smooth', fins:'medium', tail:'red', bodyW:1.35, bodyH:0.4, whiskers:true },
-  { id:28, name:'军鱼', rarity:'Rare', weight:16, basePull:22, color:'#506070', color2:'#708090', shape:'long', pattern:'scales', fins:'medium', tail:'fork', bodyW:1.2, bodyH:0.42 },
-  { id:29, name:'大眼鳜', rarity:'Rare', weight:15, basePull:24, color:'#4a3aad', color2:'#6a5acd', shape:'oval', pattern:'spots', fins:'spiny', tail:'fan', bodyW:1.05, bodyH:0.58, bigEye:true },
-  { id:30, name:'青鱼', rarity:'Rare', weight:14, basePull:30, color:'#1e6b37', color2:'#2e8b57', shape:'long', pattern:'scales', fins:'medium', tail:'fork', bodyW:1.4, bodyH:0.45 },
-  { id:31, name:'鲟鱼', rarity:'Rare', weight:12, basePull:32, color:'#494949', color2:'#696969', shape:'long', pattern:'armored', fins:'medium', tail:'shark', bodyW:1.5, bodyH:0.38 },
-  { id:32, name:'狗鱼', rarity:'Rare', weight:12, basePull:28, color:'#2662a4', color2:'#4682b4', shape:'long', pattern:'stripes', fins:'medium', tail:'fork', bodyW:1.35, bodyH:0.35 },
-  { id:33, name:'大头鲤', rarity:'Rare', weight:15, basePull:20, color:'#98680b', color2:'#b8860b', shape:'bighead', pattern:'scales', fins:'medium', tail:'fan', bodyW:1.1, bodyH:0.6 },
-  { id:34, name:'花鲈', rarity:'Rare', weight:18, basePull:22, color:'#ba8520', color2:'#daa520', shape:'oval', pattern:'spots', fins:'spiny', tail:'fork', bodyW:1.1, bodyH:0.5 },
-  { id:35, name:'鲮鱼', rarity:'Rare', weight:22, basePull:18, color:'#9d974b', color2:'#bdb76b', shape:'oval', pattern:'scales', fins:'small', tail:'fork', bodyW:1.05, bodyH:0.5 },
-  // Epic (8种)
-  { id:36, name:'金枪鱼', rarity:'Epic', weight:6, basePull:40, color:'#2149c1', color2:'#4169e1', shape:'torpedo', pattern:'none', fins:'small', tail:'crescent', bodyW:1.4, bodyH:0.42 },
-  { id:37, name:'旗鱼', rarity:'Epic', weight:5, basePull:45, color:'#0070df', color2:'#1e90ff', shape:'torpedo', pattern:'stripes', fins:'sail', tail:'crescent', bodyW:1.5, bodyH:0.35, sword:true },
-  { id:38, name:'剑鱼', rarity:'Epic', weight:5, basePull:48, color:'#4475cd', color2:'#6495ed', shape:'torpedo', pattern:'none', fins:'small', tail:'crescent', bodyW:1.5, bodyH:0.33, sword:true },
-  { id:39, name:'海鲈', rarity:'Epic', weight:5, basePull:38, color:'#3f7e80', color2:'#5f9ea0', shape:'oval', pattern:'stripes', fins:'spiny', tail:'fork', bodyW:1.2, bodyH:0.5 },
-  { id:40, name:'石首鱼', rarity:'Epic', weight:4, basePull:42, color:'#d4a700', color2:'#ffd700', shape:'oval', pattern:'scales', fins:'medium', tail:'fan', bodyW:1.15, bodyH:0.55, glow:true },
-  { id:41, name:'大黄鱼', rarity:'Epic', weight:4, basePull:36, color:'#ddaa00', color2:'#ffcc00', shape:'oval', pattern:'scales', fins:'medium', tail:'fan', bodyW:1.1, bodyH:0.52, glow:true },
-  { id:42, name:'鮸鱼', rarity:'Epic', weight:3, basePull:44, color:'#606060', color2:'#808080', shape:'long', pattern:'none', fins:'medium', tail:'fork', bodyW:1.3, bodyH:0.45 },
-  { id:43, name:'海鳗', rarity:'Epic', weight:3, basePull:50, color:'#1f1f1f', color2:'#2f2f2f', shape:'eel', pattern:'smooth', fins:'ribbon', tail:'ribbon', bodyW:1.8, bodyH:0.2 },
-  // Legendary (5种)
-  { id:44, name:'蓝鳍金枪', rarity:'Legendary', weight:1.5, basePull:65, color:'#000060', color2:'#000080', shape:'torpedo', pattern:'none', fins:'medium', tail:'crescent', bodyW:1.5, bodyH:0.45, glow:true },
-  { id:45, name:'大白鲨', rarity:'Legendary', weight:1, basePull:80, color:'#506070', color2:'#708090', shape:'shark', pattern:'none', fins:'shark', tail:'shark', bodyW:1.6, bodyH:0.5 },
-  { id:46, name:'锤头鲨', rarity:'Legendary', weight:1, basePull:70, color:'#586878', color2:'#778899', shape:'shark', pattern:'none', fins:'shark', tail:'shark', bodyW:1.5, bodyH:0.45, hammerhead:true },
-  { id:47, name:'巨型石斑', rarity:'Legendary', weight:0.8, basePull:75, color:'#3a5b1f', color2:'#556b2f', shape:'oval', pattern:'spots', fins:'spiny', tail:'fan', bodyW:1.3, bodyH:0.7 },
-  { id:48, name:'马林鱼', rarity:'Legendary', weight:0.7, basePull:85, color:'#090950', color2:'#191970', shape:'torpedo', pattern:'stripes', fins:'sail', tail:'crescent', bodyW:1.6, bodyH:0.38, sword:true },
-  // Mythic (2种 + 2彩蛋)
-  { id:49, name:'远古巨鲶', rarity:'Mythic', weight:0.3, basePull:95, color:'#5b0000', color2:'#8b0000', shape:'flat', pattern:'armored', fins:'huge', tail:'round', bodyW:1.7, bodyH:0.55, whiskers:true, glow:true },
-  { id:50, name:'深海龙鱼', rarity:'Mythic', weight:0.2, basePull:100, color:'#2b0062', color2:'#4b0082', shape:'eel', pattern:'glow', fins:'ribbon', tail:'ribbon', bodyW:1.6, bodyH:0.28, glow:true, biolum:true },
-  // 彩蛋鱼（0.1%）
-  { id:51, name:'黄金锦鲤', rarity:'Mythic', weight:0.1, basePull:60, color:'#cc9900', color2:'#ffd700', shape:'oval', pattern:'scales', fins:'flowing', tail:'flowing', bodyW:1.15, bodyH:0.6, whiskers:true, glow:true, secret:true },
-  { id:52, name:'幽灵水母', rarity:'Mythic', weight:0.1, basePull:55, color:'#b0b0e0', color2:'#e0e0ff', shape:'jellyfish', pattern:'glow', fins:'tentacle', tail:'tentacle', bodyW:0.8, bodyH:1.0, glow:true, secret:true },
-];
-
-// === 鱼类Canvas绘制系统 ===
-function drawFishBody(ctx, fish, cx, cy, scale, frame, flipX) {
-  const s = scale;
-  const bw = fish.bodyW * 50 * s;
-  const bh = fish.bodyH * 50 * s;
-  const dir = flipX ? -1 : 1;
-
-  ctx.save();
-  ctx.translate(cx, cy);
-
-  // 发光效果
-  if (fish.glow) {
-    const glowR = Math.max(bw, bh) * 1.4;
-    const grd = ctx.createRadialGradient(0, 0, glowR * 0.2, 0, 0, glowR);
-    grd.addColorStop(0, (RARITY_COLORS[fish.rarity] || '#fff') + '30');
-    grd.addColorStop(1, 'transparent');
-    ctx.fillStyle = grd;
-    ctx.beginPath();
-    ctx.arc(0, 0, glowR, 0, Math.PI * 2);
-    ctx.fill();
+function fishingV2LoadImages(names, onDone) {
+  const out = {};
+  let pending = names.length;
+  if (pending === 0) { onDone(out); return; }
+  for (const name of names) {
+    const im = new Image();
+    out[name] = im;
+    im.onload = () => { if (--pending === 0) onDone(out); };
+    im.onerror = () => { if (--pending === 0) onDone(out); };
+    im.src = FISHING_V2_BASE + name + '.png';
   }
-
-  // 生物发光效果（深海龙鱼）
-  if (fish.biolum) {
-    for (let i = 0; i < 8; i++) {
-      const lx = (i - 3.5) * bw * 0.2 * dir;
-      const ly = Math.sin(frame * 0.1 + i) * bh * 0.15;
-      const lr = 3 * s + Math.sin(frame * 0.15 + i * 0.7) * 1.5 * s;
-      ctx.fillStyle = `rgba(100,200,255,${0.3 + 0.2 * Math.sin(frame * 0.1 + i)})`;
-      ctx.beginPath();
-      ctx.arc(lx, ly, lr, 0, Math.PI * 2);
-      ctx.fill();
-    }
-  }
-
-  // === 水母特殊绘制 ===
-  if (fish.shape === 'jellyfish') {
-    // 伞
-    const umbW = bw * 0.8;
-    const umbH = bh * 0.35;
-    const pulse = 1 + Math.sin(frame * 0.06) * 0.08;
-    ctx.save();
-    ctx.scale(pulse, 1 / pulse);
-    const jellyGrd = ctx.createRadialGradient(0, -umbH * 0.3, umbW * 0.1, 0, -umbH * 0.3, umbW);
-    jellyGrd.addColorStop(0, fish.color2 + 'cc');
-    jellyGrd.addColorStop(0.6, fish.color + '88');
-    jellyGrd.addColorStop(1, fish.color + '22');
-    ctx.fillStyle = jellyGrd;
-    ctx.beginPath();
-    ctx.ellipse(0, -umbH * 0.3, umbW, umbH, 0, Math.PI, 0);
-    ctx.closePath();
-    ctx.fill();
-    ctx.restore();
-    // 触须
-    ctx.lineWidth = 1.5 * s;
-    for (let t = 0; t < 7; t++) {
-      const tx = (t - 3) * umbW * 0.25;
-      ctx.strokeStyle = fish.color2 + (t % 2 === 0 ? '66' : '44');
-      ctx.beginPath();
-      ctx.moveTo(tx, umbH * 0.05);
-      for (let seg = 1; seg <= 5; seg++) {
-        const sy = umbH * 0.05 + seg * bh * 0.13;
-        const sx = tx + Math.sin(frame * 0.04 + t + seg * 0.8) * 8 * s;
-        ctx.lineTo(sx, sy);
-      }
-      ctx.stroke();
-    }
-    ctx.restore();
-    return;
-  }
-
-  // === 常规鱼类绘制 ===
-
-  // 鱼尾
-  const tailX = -bw * 0.5 * dir;
-  ctx.fillStyle = fish.color;
-  if (fish.tail === 'fork' || fish.tail === 'crescent') {
-    const tw = bw * 0.25;
-    const th = bh * 0.55;
-    const wave = Math.sin(frame * 0.12) * 5 * s;
-    ctx.beginPath();
-    ctx.moveTo(tailX, 0);
-    ctx.lineTo(tailX - tw * dir, -th + wave);
-    ctx.lineTo(tailX - tw * 0.3 * dir, -th * 0.15);
-    ctx.lineTo(tailX - tw * dir, th + wave);
-    ctx.closePath();
-    ctx.fill();
-  } else if (fish.tail === 'fan' || fish.tail === 'flowing') {
-    const tw = bw * 0.22;
-    const th = bh * 0.5;
-    const wave = Math.sin(frame * 0.1) * 4 * s;
-    ctx.beginPath();
-    ctx.moveTo(tailX, 0);
-    ctx.quadraticCurveTo(tailX - tw * 0.8 * dir, -th * 0.5 + wave, tailX - tw * dir, -th);
-    ctx.quadraticCurveTo(tailX - tw * 1.1 * dir, 0, tailX - tw * dir, th);
-    ctx.quadraticCurveTo(tailX - tw * 0.8 * dir, th * 0.5 + wave, tailX, 0);
-    ctx.fill();
-    if (fish.tail === 'flowing') {
-      ctx.globalAlpha = 0.4;
-      ctx.fillStyle = fish.color2;
-      ctx.beginPath();
-      ctx.moveTo(tailX - tw * 0.8 * dir, 0);
-      ctx.quadraticCurveTo(tailX - tw * 1.3 * dir, -th * 0.7 + wave * 1.5, tailX - tw * 1.6 * dir, -th * 1.1);
-      ctx.quadraticCurveTo(tailX - tw * 1.8 * dir, 0, tailX - tw * 1.6 * dir, th * 1.1);
-      ctx.quadraticCurveTo(tailX - tw * 1.3 * dir, th * 0.7 + wave * 1.5, tailX - tw * 0.8 * dir, 0);
-      ctx.fill();
-      ctx.globalAlpha = 1;
-    }
-  } else if (fish.tail === 'shark') {
-    const tw = bw * 0.28;
-    const th = bh * 0.7;
-    ctx.beginPath();
-    ctx.moveTo(tailX, 0);
-    ctx.lineTo(tailX - tw * dir, -th);
-    ctx.lineTo(tailX - tw * 0.1 * dir, -th * 0.1);
-    ctx.lineTo(tailX - tw * 0.5 * dir, th * 0.5);
-    ctx.closePath();
-    ctx.fill();
-  } else if (fish.tail === 'round') {
-    ctx.beginPath();
-    ctx.ellipse(tailX - bw * 0.05 * dir, 0, bw * 0.12, bh * 0.35, 0, 0, Math.PI * 2);
-    ctx.fill();
-  } else if (fish.tail === 'ribbon') {
-    const wave = Math.sin(frame * 0.08) * 6 * s;
-    ctx.lineWidth = 2 * s;
-    ctx.strokeStyle = fish.color2 + 'aa';
-    ctx.beginPath();
-    ctx.moveTo(tailX, 0);
-    for (let seg = 1; seg <= 6; seg++) {
-      const sx = tailX - seg * bw * 0.08 * dir;
-      const sy = Math.sin(frame * 0.06 + seg * 0.9) * (3 + seg) * s;
-      ctx.lineTo(sx, sy);
-    }
-    ctx.stroke();
-  } else if (fish.tail === 'red') {
-    ctx.fillStyle = '#e03030';
-    const tw = bw * 0.22;
-    const th = bh * 0.5;
-    ctx.beginPath();
-    ctx.moveTo(tailX, 0);
-    ctx.lineTo(tailX - tw * dir, -th);
-    ctx.lineTo(tailX - tw * 0.3 * dir, 0);
-    ctx.lineTo(tailX - tw * dir, th);
-    ctx.closePath();
-    ctx.fill();
-    ctx.fillStyle = fish.color;
-  }
-
-  // 鱼身
-  const bodyGrd = ctx.createLinearGradient(0, -bh, 0, bh);
-  bodyGrd.addColorStop(0, fish.color2);
-  bodyGrd.addColorStop(0.4, fish.color);
-  bodyGrd.addColorStop(1, fish.color2);
-  ctx.fillStyle = bodyGrd;
-
-  if (fish.shape === 'shark') {
-    // 鲨鱼体型
-    ctx.beginPath();
-    ctx.moveTo(bw * 0.55 * dir, 0);
-    ctx.quadraticCurveTo(bw * 0.3 * dir, -bh * 0.8, 0, -bh * 0.5);
-    ctx.quadraticCurveTo(-bw * 0.3 * dir, -bh * 0.3, -bw * 0.5 * dir, 0);
-    ctx.quadraticCurveTo(-bw * 0.3 * dir, bh * 0.4, 0, bh * 0.4);
-    ctx.quadraticCurveTo(bw * 0.3 * dir, bh * 0.5, bw * 0.55 * dir, 0);
-    ctx.fill();
-    // 白色腹部
-    ctx.fillStyle = '#e8e8e8';
-    ctx.beginPath();
-    ctx.ellipse(bw * 0.1 * dir, bh * 0.15, bw * 0.3, bh * 0.18, 0, 0, Math.PI);
-    ctx.fill();
-    // 背鳍
-    ctx.fillStyle = fish.color;
-    ctx.beginPath();
-    ctx.moveTo(bw * 0.05 * dir, -bh * 0.48);
-    ctx.lineTo(-bw * 0.05 * dir, -bh * 1.0);
-    ctx.lineTo(-bw * 0.2 * dir, -bh * 0.42);
-    ctx.closePath();
-    ctx.fill();
-  } else if (fish.shape === 'torpedo') {
-    // 鱼雷型（金枪鱼等）
-    ctx.beginPath();
-    ctx.moveTo(bw * 0.55 * dir, 0);
-    ctx.quadraticCurveTo(bw * 0.35 * dir, -bh * 0.8, 0, -bh * 0.45);
-    ctx.quadraticCurveTo(-bw * 0.35 * dir, -bh * 0.25, -bw * 0.55 * dir, 0);
-    ctx.quadraticCurveTo(-bw * 0.35 * dir, bh * 0.25, 0, bh * 0.45);
-    ctx.quadraticCurveTo(bw * 0.35 * dir, bh * 0.8, bw * 0.55 * dir, 0);
-    ctx.fill();
-  } else if (fish.shape === 'eel') {
-    // 鳗鱼型
-    const wave = Math.sin(frame * 0.08) * 3 * s;
-    ctx.beginPath();
-    ctx.moveTo(bw * 0.5 * dir, 0);
-    ctx.quadraticCurveTo(bw * 0.3 * dir, -bh, 0, -bh * 0.8 + wave);
-    ctx.quadraticCurveTo(-bw * 0.3 * dir, -bh * 0.5, -bw * 0.5 * dir, wave * 0.5);
-    ctx.quadraticCurveTo(-bw * 0.3 * dir, bh * 0.5, 0, bh * 0.8 + wave);
-    ctx.quadraticCurveTo(bw * 0.3 * dir, bh, bw * 0.5 * dir, 0);
-    ctx.fill();
-  } else if (fish.shape === 'flat') {
-    // 扁平型（鲶鱼等）
-    ctx.beginPath();
-    ctx.moveTo(bw * 0.5 * dir, 0);
-    ctx.quadraticCurveTo(bw * 0.3 * dir, -bh * 0.7, 0, -bh * 0.35);
-    ctx.quadraticCurveTo(-bw * 0.4 * dir, -bh * 0.2, -bw * 0.5 * dir, 0);
-    ctx.quadraticCurveTo(-bw * 0.4 * dir, bh * 0.3, 0, bh * 0.4);
-    ctx.quadraticCurveTo(bw * 0.3 * dir, bh * 0.6, bw * 0.5 * dir, 0);
-    ctx.fill();
-  } else if (fish.shape === 'tall') {
-    // 高体型（鳊鱼等）
-    ctx.beginPath();
-    ctx.ellipse(0, 0, bw * 0.45, bh * 0.5, 0, 0, Math.PI * 2);
-    ctx.fill();
-  } else if (fish.shape === 'slim') {
-    // 细长型
-    ctx.beginPath();
-    ctx.ellipse(0, 0, bw * 0.5, bh * 0.4, 0, 0, Math.PI * 2);
-    ctx.fill();
-  } else if (fish.shape === 'bighead') {
-    // 大头型
-    ctx.beginPath();
-    ctx.moveTo(bw * 0.5 * dir, 0);
-    ctx.quadraticCurveTo(bw * 0.4 * dir, -bh * 0.85, 0, -bh * 0.5);
-    ctx.quadraticCurveTo(-bw * 0.35 * dir, -bh * 0.3, -bw * 0.5 * dir, 0);
-    ctx.quadraticCurveTo(-bw * 0.35 * dir, bh * 0.3, 0, bh * 0.5);
-    ctx.quadraticCurveTo(bw * 0.4 * dir, bh * 0.85, bw * 0.5 * dir, 0);
-    ctx.fill();
-  } else {
-    // 默认椭圆 (oval / long)
-    const rx = bw * 0.5;
-    const ry = bh * 0.5;
-    ctx.beginPath();
-    ctx.ellipse(0, 0, rx, ry, 0, 0, Math.PI * 2);
-    ctx.fill();
-  }
-
-  // 花纹
-  ctx.globalAlpha = 0.3;
-  if (fish.pattern === 'scales') {
-    ctx.strokeStyle = fish.color2;
-    ctx.lineWidth = 0.6 * s;
-    for (let row = -2; row <= 2; row++) {
-      for (let col = -3; col <= 2; col++) {
-        const sx = col * bw * 0.12 * dir + (row % 2 ? bw * 0.06 : 0);
-        const sy = row * bh * 0.12;
-        ctx.beginPath();
-        ctx.arc(sx, sy, bw * 0.06, 0, Math.PI, false);
-        ctx.stroke();
-      }
-    }
-  } else if (fish.pattern === 'stripes') {
-    ctx.strokeStyle = fish.color2;
-    ctx.lineWidth = 2 * s;
-    for (let i = -2; i <= 2; i++) {
-      const sx = i * bw * 0.12 * dir;
-      ctx.beginPath();
-      ctx.moveTo(sx, -bh * 0.3);
-      ctx.lineTo(sx - bw * 0.03 * dir, bh * 0.3);
-      ctx.stroke();
-    }
-  } else if (fish.pattern === 'spots') {
-    ctx.fillStyle = fish.color2;
-    for (let i = 0; i < 8; i++) {
-      const sx = ((i * 37 + fish.id * 13) % 100 - 50) * bw * 0.008 * dir;
-      const sy = ((i * 53 + fish.id * 7) % 100 - 50) * bh * 0.006;
-      const sr = (2 + (i % 3)) * s;
-      ctx.beginPath();
-      ctx.arc(sx, sy, sr, 0, Math.PI * 2);
-      ctx.fill();
-    }
-  } else if (fish.pattern === 'rainbow') {
-    const rbColors = ['#ff6666','#ffaa44','#ffff66','#66ff66','#66aaff','#aa66ff'];
-    for (let i = 0; i < rbColors.length; i++) {
-      ctx.fillStyle = rbColors[i];
-      ctx.globalAlpha = 0.15;
-      ctx.beginPath();
-      const ry = (-0.3 + i * 0.12) * bh;
-      ctx.ellipse(0, ry, bw * 0.35, bh * 0.06, 0, 0, Math.PI * 2);
-      ctx.fill();
-    }
-  } else if (fish.pattern === 'armored') {
-    ctx.strokeStyle = '#aaa';
-    ctx.lineWidth = 1 * s;
-    for (let i = -3; i <= 3; i++) {
-      const ax = i * bw * 0.1 * dir;
-      ctx.beginPath();
-      ctx.moveTo(ax, -bh * 0.4);
-      ctx.lineTo(ax, bh * 0.4);
-      ctx.stroke();
-    }
-  }
-  ctx.globalAlpha = 1;
-
-  // 鱼鳍
-  ctx.fillStyle = fish.color + 'aa';
-  if (fish.fins === 'spiny') {
-    ctx.beginPath();
-    const finBase = -bh * 0.35;
-    for (let i = 0; i < 5; i++) {
-      const fx = (bw * 0.15 - i * bw * 0.08) * dir;
-      ctx.lineTo(fx, finBase - (i % 2 ? 12 : 8) * s);
-      ctx.lineTo(fx - bw * 0.04 * dir, finBase);
-    }
-    ctx.closePath();
-    ctx.fill();
-  } else if (fish.fins === 'sail') {
-    ctx.beginPath();
-    ctx.moveTo(bw * 0.15 * dir, -bh * 0.4);
-    ctx.quadraticCurveTo(0, -bh * 1.2, -bw * 0.25 * dir, -bh * 0.5);
-    ctx.lineTo(-bw * 0.25 * dir, -bh * 0.35);
-    ctx.closePath();
-    ctx.fill();
-  } else if (fish.fins === 'medium' || fish.fins === 'small' || fish.fins === 'huge') {
-    const finSize = fish.fins === 'huge' ? 1.4 : (fish.fins === 'medium' ? 1.0 : 0.6);
-    // 胸鳍
-    ctx.beginPath();
-    ctx.moveTo(bw * 0.15 * dir, bh * 0.1);
-    ctx.quadraticCurveTo(bw * 0.25 * dir, bh * 0.5 * finSize, bw * 0.05 * dir, bh * 0.45 * finSize);
-    ctx.closePath();
-    ctx.fill();
-    // 背鳍
-    ctx.beginPath();
-    ctx.moveTo(bw * 0.1 * dir, -bh * 0.38);
-    ctx.quadraticCurveTo(0, -bh * (0.5 + 0.2 * finSize), -bw * 0.12 * dir, -bh * 0.35);
-    ctx.closePath();
-    ctx.fill();
-  } else if (fish.fins === 'shark') {
-    // 已在 shark 体型中绘制
-  } else if (fish.fins === 'flowing') {
-    ctx.globalAlpha = 0.5;
-    const wave = Math.sin(frame * 0.08) * 4 * s;
-    ctx.beginPath();
-    ctx.moveTo(bw * 0.1 * dir, bh * 0.1);
-    ctx.quadraticCurveTo(bw * 0.35 * dir, bh * 0.7 + wave, 0, bh * 0.8 + wave);
-    ctx.quadraticCurveTo(-bw * 0.1 * dir, bh * 0.5, bw * 0.1 * dir, bh * 0.1);
-    ctx.fill();
-    ctx.globalAlpha = 1;
-  }
-
-  // 剑鱼嘴
-  if (fish.sword) {
-    ctx.fillStyle = fish.color;
-    ctx.beginPath();
-    ctx.moveTo(bw * 0.5 * dir, 0);
-    ctx.lineTo(bw * 0.85 * dir, -bh * 0.05);
-    ctx.lineTo(bw * 0.85 * dir, bh * 0.03);
-    ctx.closePath();
-    ctx.fill();
-  }
-
-  // 锤头鲨
-  if (fish.hammerhead) {
-    ctx.fillStyle = fish.color;
-    ctx.beginPath();
-    const hx = bw * 0.4 * dir;
-    ctx.ellipse(hx, -bh * 0.35, bw * 0.2, bh * 0.08, 0, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.beginPath();
-    ctx.ellipse(hx, bh * 0.35, bw * 0.2, bh * 0.08, 0, 0, Math.PI * 2);
-    ctx.fill();
-    // 锤头上的眼睛
-    ctx.fillStyle = '#fff';
-    ctx.beginPath();
-    ctx.arc(hx + bw * 0.15 * dir, -bh * 0.35, 3 * s, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.fillStyle = '#111';
-    ctx.beginPath();
-    ctx.arc(hx + bw * 0.15 * dir, -bh * 0.35, 1.5 * s, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.fillStyle = '#fff';
-    ctx.beginPath();
-    ctx.arc(hx + bw * 0.15 * dir, bh * 0.35, 3 * s, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.fillStyle = '#111';
-    ctx.beginPath();
-    ctx.arc(hx + bw * 0.15 * dir, bh * 0.35, 1.5 * s, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.restore();
-    return;
-  }
-
-  // 胡须
-  if (fish.whiskers) {
-    ctx.strokeStyle = fish.color2 + 'aa';
-    ctx.lineWidth = 1.2 * s;
-    const mx = bw * 0.42 * dir;
-    for (let w = 0; w < 2; w++) {
-      const wy = (w === 0 ? 1 : -1) * bh * 0.12;
-      const wave = Math.sin(frame * 0.06 + w) * 3 * s;
-      ctx.beginPath();
-      ctx.moveTo(mx, wy);
-      ctx.quadraticCurveTo(mx + bw * 0.2 * dir, wy + (w === 0 ? 8 : -8) * s + wave, mx + bw * 0.35 * dir, wy + (w === 0 ? 12 : -12) * s + wave);
-      ctx.stroke();
-    }
-  }
-
-  // 眼睛
-  if (!fish.hammerhead) {
-    const eyeX = bw * 0.28 * dir;
-    const eyeY = -bh * 0.1;
-    const eyeR = (fish.bigEye ? 5 : 3.5) * s;
-    // 眼白
-    ctx.fillStyle = '#fff';
-    ctx.beginPath();
-    ctx.arc(eyeX, eyeY, eyeR, 0, Math.PI * 2);
-    ctx.fill();
-    // 瞳孔
-    ctx.fillStyle = '#111';
-    ctx.beginPath();
-    ctx.arc(eyeX + 0.5 * s * dir, eyeY, eyeR * 0.55, 0, Math.PI * 2);
-    ctx.fill();
-    // 高光
-    ctx.fillStyle = '#fff';
-    ctx.beginPath();
-    ctx.arc(eyeX + 1.2 * s * dir, eyeY - 1 * s, eyeR * 0.25, 0, Math.PI * 2);
-    ctx.fill();
-  }
-
-  // 嘴巴
-  if (!fish.sword) {
-    ctx.strokeStyle = fish.color + '88';
-    ctx.lineWidth = 1.2 * s;
-    const mouthX = bw * 0.45 * dir;
-    ctx.beginPath();
-    ctx.arc(mouthX, bh * 0.05, 2.5 * s, dir > 0 ? -0.4 : Math.PI - 0.4, dir > 0 ? 0.4 : Math.PI + 0.4);
-    ctx.stroke();
-  }
-
-  // 彩虹鳑鲏的闪光
-  if (fish.rainbow) {
-    ctx.globalAlpha = 0.2 + 0.1 * Math.sin(frame * 0.08);
-    const rbGrd = ctx.createLinearGradient(-bw * 0.3, -bh * 0.3, bw * 0.3, bh * 0.3);
-    rbGrd.addColorStop(0, '#ff666644');
-    rbGrd.addColorStop(0.25, '#ffff6644');
-    rbGrd.addColorStop(0.5, '#66ff6644');
-    rbGrd.addColorStop(0.75, '#6666ff44');
-    rbGrd.addColorStop(1, '#ff66ff44');
-    ctx.fillStyle = rbGrd;
-    ctx.beginPath();
-    ctx.ellipse(0, 0, bw * 0.4, bh * 0.4, 0, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.globalAlpha = 1;
-  }
-
-  ctx.restore();
 }
 
-const RARITY_COLORS = {
-  Common: '#a0a0a0', Rare: '#4fc3f7', Epic: '#ab47bc', Legendary: '#ff8f00', Mythic: '#ff1744'
-};
-const RARITY_BG = {
-  Common: 'rgba(160,160,160,0.15)', Rare: 'rgba(79,195,247,0.15)', Epic: 'rgba(171,71,188,0.15)',
-  Legendary: 'rgba(255,143,0,0.15)', Mythic: 'rgba(255,23,68,0.15)'
-};
-const SIZE_LABELS = ['小', '中', '大'];
-const SIZE_MULTIPLIERS = [0.8, 1.0, 1.3];
-
-function rollFish() {
-  const totalWeight = FISH_DB.reduce((s, f) => s + f.weight, 0);
-  let r = Math.random() * totalWeight;
-  for (let i = 0; i < FISH_DB.length; i++) {
-    r -= FISH_DB[i].weight;
-    if (r <= 0) {
-      const sizeIdx = Math.random() < 0.15 ? 2 : (Math.random() < 0.4 ? 0 : 1);
-      return { fish: FISH_DB[i], sizeIdx };
-    }
-  }
-  return { fish: FISH_DB[0], sizeIdx: 1 };
-}
-
-// === 图鉴存储 ===
-function loadCollection() {
+function fishingV2PlaySfx(baseName) {
   try {
-    const saved = localStorage.getItem('fishing-collection');
-    return saved ? JSON.parse(saved) : {};
-  } catch { return {}; }
-}
-function saveCollection(col) {
-  try { localStorage.setItem('fishing-collection', JSON.stringify(col)); } catch {}
+    const a = new Audio(FISHING_V2_BASE + baseName + '.wav');
+    a.volume = 0.65;
+    a.play().catch(() => {});
+  } catch (_) {}
 }
 
-// === 钓鱼游戏主函数 ===
+function fishingV2SendHardware(msg) {
+  const line = msg.endsWith('\n') ? msg : msg + '\n';
+  if (typeof writeToPort === 'function') {
+    writeToPort('port1', line).catch(() => {});
+  }
+}
+
 function startFishing() {
-  const W = gameCanvas.width, H = gameCanvas.height;
+  const W = gameCanvas.width;
+  const H = gameCanvas.height;
   const ctx = gameCtx;
+  const sx = W / 900;
+  const sy = H / 600;
 
-  // 图鉴数据
-  let collection = loadCollection();
-
-  // 游戏状态
-  const f = {
-    mode: 'menu',        // menu | idle | casting | waiting | hooked | fighting | caught | escaped | catalog
-    frame: 0,
-    menuIndex: 0,        // 0=开始钓鱼, 1=鱼类图鉴
-    // 钓鱼状态
-    castAnim: 0,
-    waitTimer: 0,
-    waitDuration: 0,
-    hookedTimer: 0,
-    // 对抗期
-    currentFish: null,
-    currentSize: 1,
-    progress: 50,         // 0-100，50=初始，100=成功，0=逃跑
-    fishPull: 0,          // 鱼的拉力
-    reelPower: 0,         // 玩家的卷线力
-    reelSmooth: 0,        // 平滑后的卷线力
-    tension: 0,           // 线的张力（拉力差）
-    // DEGREE 卷线
-    lastDegree: null,
-    degreeAccum: 0,
-    // RAW_JOY 辅助
-    joyY: 50,
-    // 屏幕震动
-    shakeX: 0, shakeY: 0, shakeTimer: 0,
-    // 动画
-    bobberY: 0,
-    waterOffset: 0,
-    resultTimer: 0,
-    // 鱼 AI（对抗期鱼的行为）
-    fishBurstTimer: 0,    // 鱼的爆发冲刺
-    fishBurstDir: 1,
-    fishRestTimer: 0,     // 鱼的休息期
-    // 图鉴翻页
-    catalogPage: 0,
-    catalogPerPage: 10,
-    // 统计
-    totalCaught: 0,
-    totalEscaped: 0,
-    // 气泡效果
-    bubbles: [],
-    // 连胜
-    streak: 0,
-    // === 三段式 3 回合制系统 ===
-    zoneType: 'green',       // 当前区域: 'red' | 'yellow' | 'green'
-    zoneTimer: 0,            // 当前区域剩余帧数（判定窗口）
-    zoneDuration: 0,         // 当前区域总帧数
-    zoneTransition: 0,       // 区域切换过渡动画
-    reelSpeedRaw: 0,         // 玩家原始转速（每帧角度变化）
-    reelSpeedSmooth: 0,      // 平滑后的转速
-    speedMatch: 0,           // 当前速度匹配度 0-1 (1=完美匹配)
-    speedMatchDisplay: 0,    // 用于UI显示的平滑匹配度
-    // 3 回合制
-    correctCount: 0,         // 已完成的正确操作次数（满3次=成功捕获）
-    roundState: 'judging',   // 'judging'=判定中 | 'success'=本轮成功 | 'fail'=本轮失败
-    roundResultTimer: 0,     // 本轮结果展示计时
-    matchAccum: 0,           // 本轮匹配度累积（用于判定成功/失败）
-    matchSamples: 0,         // 本轮采样次数
-    // 鱼的反向拉力转速
-    reverseReelAccum: 0,     // 反向卷线累积
+  const layout = {
+    rodTopX: 414 * sx,
+    rodTopY: 395 * sy,
+    catX: 450 * sx,
+    startY: 700 * sy,
+    targetY: 420 * sy,
+    baitRegions: [
+      { l: 125 * sx, t: 320 * sy, r: 198 * sx, b: 360 * sy },
+      { l: 198 * sx, t: 307 * sy, r: 367 * sx, b: 417 * sy },
+      { l: 370 * sx, t: 300 * sy, r: 422 * sx, b: 337 * sy },
+    ],
+    hintPos: { x: 100 * sx, y: 500 * sy },
+    cdPos: { x: 800 * sx, y: 500 * sy },
+    fishCountBoard: { x: 125 * sx, y: 70 * sy },
+    fishWeightBoard: { x: 750 * sx, y: 70 * sy },
+    countBoard: { x: 420 * sx, y: 70 * sy },
+    castTextLeft: { x: 360 * sx, y: 82 * sy },
+    castTextRight: { x: 480 * sx, y: 82 * sy },
+    numFish: { x: 170 * sx, y: 73 * sy },
+    numKg: { x: 800 * sx, y: 73 * sy },
+    rotText: { x: 100 * sx - 10 * sx, y: 500 * sy },
+    cdText: { x: 800 * sx, y: 500 * sy - 10 * sy },
+    fishCard: { x: 450 * sx, y: 240 * sy },
+    dataDash: { x: 450 * sx, y: 240 * sy },
+    dashTotalKg: { x: 500 * sx, y: 325 * sy },
+    dashAvgKg: { x: 520 * sx, y: 375 * sy },
+    startFishBtn: { x: 450 * sx, y: 500 * sy },
   };
 
-  gameState.fishing = f;
+  const imgNames = [
+    '开始界面', '钓鱼界面', '结算界面蒙层', '数据看板', '次数看板',
+    '呆猫走路1', '呆猫走路2', '呆猫钓鱼姿势',
+    '开始钓鱼1', '开始钓鱼2', '继续钓鱼1', '继续钓鱼2', '查看数据1', '查看数据2',
+    '鱼饵', '鱼儿咬钩', '倒计时', '鱼数量', '鱼重量',
+    ...FISHING_V2_FISH_TYPES,
+  ];
 
-  // 清除旧的 animationId
-  if (gameAnimationId) cancelAnimationFrame(gameAnimationId);
+  let imgs = {};
+  let assetsReady = false;
+  fishingV2LoadImages(imgNames, (loaded) => {
+    imgs = loaded;
+    assetsReady = true;
+  });
 
-  // === 输入处理函数 ===
-  window._fishingHandleDirection = function(dir, source) {
-    if (source !== 'port1') return;
-    if (f.mode === 'menu') {
-      if (dir === 'UP') f.menuIndex = Math.max(0, f.menuIndex - 1);
-      if (dir === 'DOWN') f.menuIndex = Math.min(1, f.menuIndex + 1);
-    } else if (f.mode === 'catalog') {
-      const maxPage = Math.ceil(FISH_DB.length / f.catalogPerPage) - 1;
-      if (dir === 'LEFT') f.catalogPage = Math.max(0, f.catalogPage - 1);
-      if (dir === 'RIGHT') f.catalogPage = Math.min(maxPage, f.catalogPage + 1);
-      if (dir === 'UP') f.catalogPage = Math.max(0, f.catalogPage - 1);
-      if (dir === 'DOWN') f.catalogPage = Math.min(maxPage, f.catalogPage + 1);
-    }
+  let bgm = null;
+  try {
+    bgm = new Audio(FISHING_V2_BASE + '背景音乐.mp3');
+    bgm.loop = true;
+    bgm.volume = 0.45;
+  } catch (_) {}
+
+  const maxCasts = 5;
+  const state = {
+    gameState: 'start',
+    viewDataState: 'normal',
+    fishCount: 0,
+    fishWeight: 0,
+    castCount: 0,
+    blinkPhase: 0,
+    showFirstImage: true,
+    walkPhase: 0,
+    showWalk1: true,
+    catY: layout.startY,
+    catMoving: false,
+    catScale: 1,
+    baitX: 0,
+    baitY: 0,
+    baitTargetX: 0,
+    baitTargetY: 0,
+    baitMoving: false,
+    baitVisible: false,
+    baitSpeed: 3 * ((sx + sy) / 2),
+    fishBiting: false,
+    fishBiteAt: 0,
+    requiredRotations: 0,
+    showRotationText: false,
+    rotationTextBlink: true,
+    rotationBlinkT: 0,
+    fishEscapeAt: 0,
+    fishEscaped: false,
+    motorRawDeg: 0,
+    angleRefDeg: 0,
+    motorRotations: 0,
+    gyroJump: false,
+    lastJumpAt: -999,
+    currentFishType: null,
+    fishBiteSwing: 0,
+    lastFrameMs: performance.now(),
+    keySimRot: 0,
+    splashPlayed: false,
   };
 
-  window._fishingHandleButton = function(pressed, source) {
-    if (source !== 'port1' || !pressed) return;
-    if (f.mode === 'menu') {
-      if (f.menuIndex === 0) { f.mode = 'idle'; }
-      else if (f.menuIndex === 1) { f.mode = 'catalog'; f.catalogPage = 0; }
-    } else if (f.mode === 'idle') {
-      startCast();
-    } else if (f.mode === 'fighting') {
-      // BTN 也可以增加卷线力（辅助）
-      f.reelPower += 8;
-    } else if (f.mode === 'caught' || f.mode === 'escaped') {
-      if (f.resultTimer > 60) { f.mode = 'idle'; }
-    } else if (f.mode === 'catalog') {
-      f.mode = 'menu';
-    }
-  };
-
-  window._fishingHandleDegree = function(value, source) {
-    if (source !== 'port1') return;
-    if (f.mode === 'fighting') {
-      if (f.lastDegree !== null) {
-        let rawDelta = value - f.lastDegree;
-        if (rawDelta > 180) rawDelta -= 360;
-        if (rawDelta < -180) rawDelta += 360;
-        const absDelta = Math.abs(rawDelta);
-        if (absDelta > 2) { // 死区
-          f.degreeAccum += absDelta * 0.15;
-          // 红色区域需要反向转动：负值 delta 表示反向
-          if (rawDelta < 0) {
-            f.reverseReelAccum += rawDelta * 0.1;
-          }
-        }
-      }
-      f.lastDegree = value;
-    } else {
-      f.lastDegree = value;
-    }
-  };
-
-  window._fishingHandleRawJoy = function(x, y, source) {
-    if (source !== 'port1') return;
-    f.joyY = y; // 0-100，50=中心
-    if (f.mode === 'fighting') {
-      // 向上推（y < 30）增加卷线力
-      if (y < 30) {
-        f.reelPower += (30 - y) * 0.04;
-      }
-    }
-  };
-
-  // === 钓鱼专用串口回调（来自钓鱼竿控制器）===
-
-  // FISH:CAST — 甩杆（IMU 检测到甩动动作）
-  window._fishingHandleFishCast = function(source) {
-    if (source !== 'port1') return;
-    if (f.mode === 'idle') {
-      startCast(); // 甩杆
-    } else if (f.mode === 'menu') {
-      // 菜单中甩杆 = 确认选择
-      if (f.menuIndex === 0) { f.mode = 'idle'; }
-      else if (f.menuIndex === 1) { f.mode = 'catalog'; f.catalogPage = 0; }
-    } else if (f.mode === 'caught' || f.mode === 'escaped') {
-      if (f.resultTimer > 60) { f.mode = 'idle'; }
-    }
-  };
-
-  // FISH:REEL:<delta_deg> — 卷线（电机旋转角度增量，每约10度发一次）
-  window._fishingHandleFishReel = function(delta, source) {
-    if (source !== 'port1') return;
-    if (f.mode === 'fighting') {
-      // delta 是带符号的角度增量（正=顺时针，负=逆时针）
-      const absDelta = Math.abs(delta);
-      // 正向转 → 卷线力
-      f.reelPower += absDelta * 0.8;
-      f.degreeAccum += absDelta * 0.2;
-      // 反向转 → 红色区域需要的反向力
-      if (delta < 0) {
-        f.reverseReelAccum += delta * 0.15;
-      }
-    }
-  };
-
-  // FISH:SHAKE:<intensity 0-100> — 逗鱼晃动
-  window._fishingHandleFishShake = function(intensity, source) {
-    if (source !== 'port1') return;
-    if (f.mode === 'fighting') {
-      // 晃动可以有小幅度卷线效果（逗鱼），强度越大效果越好
-      const power = intensity * 0.03; // 0-3 的卷线力
-      f.reelPower += power;
-    } else if (f.mode === 'waiting') {
-      // 等待期晃动 → 可以轻微影响上钩时间（逗鱼加速）
-      if (intensity > 30 && f.waitTimer > 30) {
-        f.waitTimer = Math.max(1, f.waitTimer - 2); // 轻微加速上钩
-      }
-    }
-  };
-
-  // === 键盘处理 ===
-  function handleKey(e) {
-    if (f.mode === 'menu') {
-      if (e.key === 'ArrowUp' || e.key === 'w') f.menuIndex = Math.max(0, f.menuIndex - 1);
-      if (e.key === 'ArrowDown' || e.key === 's') f.menuIndex = Math.min(1, f.menuIndex + 1);
-      if (e.key === 'Enter' || e.key === ' ') {
-        if (f.menuIndex === 0) { f.mode = 'idle'; }
-        else { f.mode = 'catalog'; f.catalogPage = 0; }
-      }
-    } else if (f.mode === 'idle') {
-      if (e.key === ' ' || e.key === 'Enter') startCast();
-    } else if (f.mode === 'fighting') {
-      if (e.key === ' ' || e.key === 'ArrowUp' || e.key === 'w') {
-        f.reelPower += 6;
-        f.degreeAccum += 2;
-      }
-      if (e.key === 'ArrowDown' || e.key === 's') {
-        // 反方向操作（红色区域需要）
-        f.reverseReelAccum -= 3;
-      }
-    } else if (f.mode === 'caught' || f.mode === 'escaped') {
-      if (f.resultTimer > 60) {
-        if (e.key === ' ' || e.key === 'Enter') f.mode = 'idle';
-      }
-    } else if (f.mode === 'catalog') {
-      const maxPage = Math.ceil(FISH_DB.length / f.catalogPerPage) - 1;
-      if (e.key === 'ArrowLeft' || e.key === 'a') f.catalogPage = Math.max(0, f.catalogPage - 1);
-      if (e.key === 'ArrowRight' || e.key === 'd') f.catalogPage = Math.min(maxPage, f.catalogPage + 1);
-      if (e.key === 'Escape' || e.key === 'Backspace' || e.key === 'Enter') f.mode = 'menu';
-    }
+  function pickBaitLanding() {
+    const reg = layout.baitRegions[Math.floor(Math.random() * layout.baitRegions.length)];
+    const x = reg.l + Math.random() * (reg.r - reg.l);
+    const y = reg.t + Math.random() * (reg.b - reg.t);
+    return { x, y };
   }
 
-  // 添加键盘监听器
-  const origKeyHandler = gameKeyHandler;
-  const fishKeyHandler = function(e) {
-    if (currentGame !== 'fishing') return;
-    handleKey(e);
-  };
-  document.addEventListener('keydown', fishKeyHandler);
-
-  // 清理函数
-  gameState._jumpCleanup = function() {
-    document.removeEventListener('keydown', fishKeyHandler);
-  };
-
-  // === 甩竿 ===
-  function startCast() {
-    f.mode = 'casting';
-    f.castAnim = 0;
+  function resetBaitState() {
+    state.baitX = 0;
+    state.baitY = 0;
+    state.baitMoving = false;
+    state.baitVisible = false;
+    state.fishBiting = false;
+    state.fishBiteAt = 0;
+    state.showRotationText = false;
+    state.splashPlayed = false;
   }
 
-  // === 更新逻辑 ===
-  function update() {
-    f.frame++;
-    f.waterOffset += 0.5;
-
-    // 更新气泡
-    for (let i = f.bubbles.length - 1; i >= 0; i--) {
-      const b = f.bubbles[i];
-      b.y -= b.speed;
-      b.x += Math.sin(f.frame * 0.05 + b.phase) * 0.3;
-      b.life--;
-      if (b.life <= 0) f.bubbles.splice(i, 1);
-    }
-    if (f.frame % 20 === 0 && f.bubbles.length < 15) {
-      f.bubbles.push({
-        x: 100 + Math.random() * (W - 200),
-        y: H - 40 + Math.random() * 30,
-        r: 2 + Math.random() * 4,
-        speed: 0.3 + Math.random() * 0.5,
-        phase: Math.random() * Math.PI * 2,
-        life: 120 + Math.random() * 80,
-      });
-    }
-
-    // 屏幕震动衰减
-    if (f.shakeTimer > 0) {
-      f.shakeTimer--;
-      f.shakeX = (Math.random() - 0.5) * f.shakeTimer * 0.8;
-      f.shakeY = (Math.random() - 0.5) * f.shakeTimer * 0.8;
-    } else {
-      f.shakeX = 0; f.shakeY = 0;
-    }
-
-    if (f.mode === 'casting') {
-      f.castAnim++;
-      if (f.castAnim > 40) {
-        f.mode = 'waiting';
-        f.waitDuration = 180 + Math.random() * 420; // 3-10秒 (60fps)
-        f.waitTimer = 0;
-      }
-    }
-
-    else if (f.mode === 'waiting') {
-      f.waitTimer++;
-      f.bobberY = Math.sin(f.frame * 0.08) * 3; // 浮标轻微浮动
-      if (f.waitTimer >= f.waitDuration) {
-        // 上钩！
-        const roll = rollFish();
-        f.currentFish = roll.fish;
-        f.currentSize = roll.sizeIdx;
-        f.mode = 'hooked';
-        f.hookedTimer = 0;
-        f.shakeTimer = 30;
-        // 初始化对抗
-        const sizeMul = SIZE_MULTIPLIERS[f.currentSize];
-        f.fishPull = f.currentFish.basePull * sizeMul;
-        f.progress = 50;
-        f.reelPower = 0;
-        f.reelSmooth = 0;
-        f.degreeAccum = 0;
-        f.lastDegree = null;
-        f.fishBurstTimer = 60 + Math.random() * 120;
-        f.fishBurstDir = 1;
-        f.fishRestTimer = 0;
-        // 初始化三段式 3 回合制
-        const zoneChoices = ['red', 'yellow', 'green'];
-        f.zoneType = zoneChoices[Math.floor(Math.random() * zoneChoices.length)];
-        f.zoneDuration = 240 + Math.random() * 120;  // 每回合 4-6 秒判定窗口（宽裕）
-        f.zoneTimer = f.zoneDuration;
-        f.zoneTransition = 30;
-        f.reelSpeedRaw = 0;
-        f.reelSpeedSmooth = 0;
-        f.speedMatch = 0;
-        f.speedMatchDisplay = 0;
-        f.correctCount = 0;        // 重置正确次数
-        f.roundState = 'judging';  // 开始判定
-        f.roundResultTimer = 0;
-        f.matchAccum = 0;
-        f.matchSamples = 0;
-        f.reverseReelAccum = 0;
-        f._totalRounds = 0;
-      }
-    }
-
-    else if (f.mode === 'hooked') {
-      f.hookedTimer++;
-      if (f.hookedTimer > 90) {
-        f.mode = 'fighting';
-      }
-    }
-
-    else if (f.mode === 'fighting') {
-      // === 3 回合制对抗系统 ===
-      // 每回合有一个判定窗口（区域），玩家需要做正确操作
-      // 完成 3 次正确操作 = 捕获成功
-      // 连续失败 2 次 = 鱼逃跑
-
-      // 计算进度条位置（用于视觉展示，基于 correctCount）
-      f.progress = (f.correctCount / 3) * 100;
-
-      if (f.roundState === 'judging') {
-        // === 判定阶段 ===
-        f.zoneTimer--;
-        if (f.zoneTransition > 0) f.zoneTransition--;
-
-        // === 计算玩家转速 ===
-        f.reelSpeedRaw = f.degreeAccum + f.reelPower * 0.4 + f.reverseReelAccum;
-        f.degreeAccum *= 0.3;
-        f.reelPower *= 0.8;
-        f.reverseReelAccum *= 0.3;
-        f.reelSpeedSmooth += (f.reelSpeedRaw - f.reelSpeedSmooth) * 0.4;
-        const speed = Math.abs(f.reelSpeedSmooth);
-
-        // === 三段式速度匹配判定 ===
-        let matchScore = 0;
-        const speedThreshGreen = 2.0;       // 绿色区快速阈值（降低难度）
-        const speedThreshYellow = 2.0;      // 黄色区慢速上限（放宽）
-        const speedThreshYellowMin = 0.15;  // 黄色区最小转速（更低门槛）
-
-        if (f.zoneType === 'green') {
-          if (speed >= speedThreshGreen) {
-            matchScore = 1;
-          } else if (speed >= 0.5) {
-            matchScore = 0.5;
-          } else {
-            matchScore = -0.2;
-          }
-        } else if (f.zoneType === 'yellow') {
-          if (speed >= speedThreshYellowMin && speed <= speedThreshYellow) {
-            matchScore = 1;
-          } else if (speed < speedThreshYellowMin) {
-            matchScore = -0.1;
-          } else {
-            matchScore = -0.3;
-          }
-        } else if (f.zoneType === 'red') {
-          if (f.reverseReelAccum < -0.3 || speed <= 0.2) {
-            matchScore = 1;
-          } else {
-            matchScore = -0.3;
-          }
-        }
-
-        f.speedMatch = matchScore;
-        f.speedMatchDisplay += (matchScore - f.speedMatchDisplay) * 0.15;
-        f.tension = Math.abs(matchScore);
-
-        // 累积匹配度采样
-        if (matchScore > 0.3) {
-          f.matchAccum += matchScore;
-          f.matchSamples++;
-        }
-
-        // 判定时机：倒计时结束，或提前达到足够好的匹配
-        const earlySuccess = f.matchSamples >= 30 && (f.matchAccum / f.matchSamples) > 0.6;
-
-        if (f.zoneTimer <= 0 || earlySuccess) {
-          // 本轮结束，计算结果
-          const avgMatch = f.matchSamples > 0 ? f.matchAccum / f.matchSamples : 0;
-
-          if (avgMatch > 0.3 || earlySuccess) {
-            // ✅ 本轮成功！
-            f.roundState = 'success';
-            f.roundResultTimer = 60; // 1 秒展示
-            f.correctCount++;
-            f.shakeTimer = 5;
-          } else {
-            // ❌ 本轮失败
-            f.roundState = 'fail';
-            f.roundResultTimer = 60;
-            f.shakeTimer = 10;
-          }
-        }
-      }
-
-      else if (f.roundState === 'success' || f.roundState === 'fail') {
-        // 展示本轮结果
-        f.roundResultTimer--;
-
-        if (f.roundResultTimer <= 0) {
-          // 检查是否已达成胜利/失败条件
-          if (f.correctCount >= 3) {
-            // 🎉 3 次正确 = 捕获成功！
-            f.progress = 100;
-            f.mode = 'caught';
-            f.resultTimer = 0;
-            f.streak++;
-            f.totalCaught++;
-            const fishId = String(f.currentFish.id);
-            if (!collection[fishId]) {
-              collection[fishId] = { count: 0, maxSize: -1 };
-            }
-            collection[fishId].count++;
-            if (f.currentSize > collection[fishId].maxSize) {
-              collection[fishId].maxSize = f.currentSize;
-            }
-            saveCollection(collection);
-            f.shakeTimer = 15;
-          } else if (f.roundState === 'fail' && f.correctCount === 0 && (f.correctCount + 3 - f.correctCount) <= 0) {
-            // 这个条件实际不会触发，下面用更简单的逻辑
-            // 鱼逃跑逻辑改为：每回合失败不直接逃跑，而是不加分
-            // 最终给玩家足够多的机会（最多 5 回合）
-          }
-
-          // 进入下一回合
-          const zones = ['red', 'yellow', 'green'];
-          let newZone;
-          do {
-            newZone = zones[Math.floor(Math.random() * zones.length)];
-          } while (newZone === f.zoneType);
-          f.zoneType = newZone;
-          f.zoneDuration = 240 + Math.random() * 120;  // 每回合 4-6 秒
-          f.zoneTimer = f.zoneDuration;
-          f.zoneTransition = 30;
-          f.roundState = 'judging';
-          f.matchAccum = 0;
-          f.matchSamples = 0;
-
-          // 如果已经进行了太多回合（correctCount + failedRounds >= 5），鱼跑了
-          // 用 frame 来粗略计算已经打了几回合
-          // 更简单的方式：直接用 totalRounds 计数
-          if (!f._totalRounds) f._totalRounds = 0;
-          f._totalRounds++;
-          if (f._totalRounds > 5 && f.correctCount < 3) {
-            // 5 回合内没完成 3 次正确 = 鱼跑了
-            f.progress = 0;
-            f.mode = 'escaped';
-            f.resultTimer = 0;
-            f.streak = 0;
-            f.totalEscaped++;
-          }
-        }
-      }
-    }
-
-    else if (f.mode === 'caught' || f.mode === 'escaped') {
-      f.resultTimer++;
-    }
+  function beginFromStartScreen() {
+    fishingV2PlaySfx('按钮音效');
+    fishingV2PlaySfx('脚步声');
+    state.gameState = 'fishing';
+    state.catY = layout.startY;
+    state.catMoving = true;
+    state.showWalk1 = true;
+    state.catScale = 1;
+    resetBaitState();
+    state.motorRawDeg = 0;
+    state.angleRefDeg = 0;
+    state.motorRotations = 0;
+    fishingV2SendHardware('RESET');
   }
 
-  // === 绘制函数 ===
+  function beginContinueFishing() {
+    state.gameState = 'fishing';
+    state.catY = layout.targetY;
+    state.catMoving = false;
+    state.showWalk1 = false;
+    state.catScale = 0.5;
+    state.baitX = layout.rodTopX;
+    state.baitY = layout.rodTopY;
+    const land = pickBaitLanding();
+    state.baitTargetX = land.x;
+    state.baitTargetY = land.y;
+    state.baitMoving = true;
+    state.baitVisible = true;
+    state.castCount += 1;
+    state.fishBiting = false;
+    state.showRotationText = false;
+    state.fishEscaped = false;
+    state.splashPlayed = false;
+    fishingV2PlaySfx('甩杆声音');
+    fishingV2SendHardware('RESET');
+  }
 
-  // 水面背景
-  function drawWater() {
-    // 天空渐变
-    const skyGrad = ctx.createLinearGradient(0, 0, 0, H * 0.45);
-    skyGrad.addColorStop(0, '#0a1628');
-    skyGrad.addColorStop(1, '#1a3a5c');
-    ctx.fillStyle = skyGrad;
-    ctx.fillRect(0, 0, W, H * 0.45);
-
-    // 星星
-    ctx.fillStyle = 'rgba(255,255,255,0.5)';
-    for (let i = 0; i < 30; i++) {
-      const sx = (i * 137.5 + 50) % W;
-      const sy = (i * 89.3 + 20) % (H * 0.35);
-      const sr = 0.5 + (i % 3) * 0.5;
-      const blink = 0.3 + 0.7 * Math.abs(Math.sin(f.frame * 0.01 + i));
-      ctx.globalAlpha = blink * 0.6;
-      ctx.fillRect(sx, sy, sr, sr);
-    }
-    ctx.globalAlpha = 1;
-
-    // 月亮
-    ctx.fillStyle = '#ffeebb';
-    ctx.beginPath();
-    ctx.arc(W - 100, 60, 30, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.fillStyle = '#0a1628';
-    ctx.beginPath();
-    ctx.arc(W - 85, 50, 28, 0, Math.PI * 2);
-    ctx.fill();
-
-    // 水面
-    const waterY = H * 0.45;
-    const waterGrad = ctx.createLinearGradient(0, waterY, 0, H);
-    waterGrad.addColorStop(0, '#0d3b66');
-    waterGrad.addColorStop(0.5, '#062744');
-    waterGrad.addColorStop(1, '#041c2c');
-    ctx.fillStyle = waterGrad;
-    ctx.fillRect(0, waterY, W, H - waterY);
-
-    // 水面波纹线
-    ctx.strokeStyle = 'rgba(100,180,255,0.2)';
-    ctx.lineWidth = 1;
-    for (let row = 0; row < 5; row++) {
-      ctx.beginPath();
-      const wy = waterY + 10 + row * 25;
-      for (let x = 0; x <= W; x += 5) {
-        const y = wy + Math.sin((x + f.waterOffset * (1 + row * 0.3)) * 0.02) * (3 + row);
-        if (x === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  function onResultGyroShakeFromParent() {
+    if (state.castCount >= maxCasts) {
+      if (state.viewDataState === 'normal') {
+        state.viewDataState = 'data_dashboard';
+        fishingV2PlaySfx('按钮音效');
       }
-      ctx.stroke();
+      return;
     }
-
-    // 气泡
-    for (let i = 0; i < f.bubbles.length; i++) {
-      const b = f.bubbles[i];
-      const alpha = Math.min(1, b.life / 30);
-      ctx.strokeStyle = `rgba(150,220,255,${alpha * 0.4})`;
-      ctx.lineWidth = 1;
-      ctx.beginPath();
-      ctx.arc(b.x, b.y, b.r, 0, Math.PI * 2);
-      ctx.stroke();
-    }
+    beginContinueFishing();
   }
 
-  // 钓鱼人
-  function drawFisherman() {
-    const px = 120, py = H * 0.45 - 10;
-
-    // 身体（简笔画风格）
-    ctx.fillStyle = '#5c3d2e';
-    ctx.fillRect(px - 8, py - 45, 16, 30); // 身体
-    ctx.fillStyle = '#d2a679';
-    ctx.beginPath();
-    ctx.arc(px, py - 55, 10, 0, Math.PI * 2); // 头
-    ctx.fill();
-    ctx.fillStyle = '#3a6b35';
-    ctx.fillRect(px - 12, py - 62, 24, 8); // 帽子
-
-    // 钓竿
-    ctx.strokeStyle = '#8b6914';
-    ctx.lineWidth = 2.5;
-    ctx.beginPath();
-    ctx.moveTo(px + 8, py - 35);
-    const rodTipX = px + 180;
-    const rodTipY = py - 85;
-    ctx.quadraticCurveTo(px + 100, py - 90, rodTipX, rodTipY);
-    ctx.stroke();
-
-    // 钓线
-    if (f.mode === 'waiting' || f.mode === 'hooked' || f.mode === 'fighting') {
-      ctx.strokeStyle = 'rgba(255,255,255,0.5)';
-      ctx.lineWidth = 1;
-      const lineEndY = H * 0.45 + 30 + f.bobberY;
-      ctx.beginPath();
-      ctx.moveTo(rodTipX, rodTipY);
-
-      if (f.mode === 'fighting') {
-        // 对抗期线会颤抖
-        const jitter = f.tension * 3;
-        ctx.quadraticCurveTo(
-          rodTipX + 20 + Math.sin(f.frame * 0.3) * jitter,
-          (rodTipY + lineEndY) / 2,
-          rodTipX + 30,
-          lineEndY
-        );
-      } else {
-        ctx.lineTo(rodTipX + 30, lineEndY);
-      }
-      ctx.stroke();
-
-      // 浮标
-      const bobX = rodTipX + 30;
-      const bobY = lineEndY;
-      if (f.mode === 'hooked') {
-        // 上钩时浮标急剧下沉
-        ctx.fillStyle = '#ff3333';
-      } else {
-        ctx.fillStyle = '#ff6633';
-      }
-      ctx.beginPath();
-      ctx.ellipse(bobX, bobY, 4, 6, 0, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.fillStyle = '#fff';
-      ctx.fillRect(bobX - 1, bobY - 8, 2, 5);
-    }
+  function updateMotorFromRaw(rawDeg) {
+    state.motorRawDeg = rawDeg;
+    const rel = state.motorRawDeg - state.angleRefDeg;
+    state.motorRotations = rel / 360;
   }
 
-  // 菜单
-  function drawMenu() {
-    drawWater();
-    drawFisherman();
-
-    // 标题
-    ctx.fillStyle = '#fff';
-    ctx.font = 'bold 42px sans-serif';
-    ctx.textAlign = 'center';
-    ctx.fillText('🎣 钓鱼达人', W / 2, 80);
-
-    // 副标题
-    ctx.fillStyle = 'rgba(255,255,255,0.5)';
-    ctx.font = '16px sans-serif';
-    ctx.fillText('50种鱼类 · 图鉴收集 · 星瀚手柄控制', W / 2, 110);
-
-    // 菜单选项
-    const options = ['🎣 开始钓鱼', '📖 鱼类图鉴'];
-    for (let i = 0; i < options.length; i++) {
-      const y = 200 + i * 60;
-      const selected = i === f.menuIndex;
-
-      if (selected) {
-        ctx.fillStyle = 'rgba(79,195,247,0.2)';
-        const tw = 220;
-        ctx.beginPath();
-        ctx.roundRect(W / 2 - tw / 2, y - 22, tw, 44, 10);
-        ctx.fill();
-        ctx.strokeStyle = '#4fc3f7';
-        ctx.lineWidth = 2;
-        ctx.stroke();
-      }
-
-      ctx.fillStyle = selected ? '#4fc3f7' : 'rgba(255,255,255,0.6)';
-      ctx.font = selected ? 'bold 22px sans-serif' : '20px sans-serif';
-      ctx.textAlign = 'center';
-      ctx.fillText(options[i], W / 2, y + 7);
-    }
-
-    // 统计
-    const unlocked = Object.keys(collection).length;
-    ctx.fillStyle = 'rgba(255,255,255,0.35)';
-    ctx.font = '14px sans-serif';
-    ctx.fillText(`已收集 ${unlocked}/${FISH_DB.length} 种  |  捕获 ${f.totalCaught}  |  逃跑 ${f.totalEscaped}`, W / 2, H - 30);
-
-    // 操作提示
-    ctx.fillText('摇杆/↑↓ 选择 · 按键/Enter 确认', W / 2, H - 12);
+  function drawScaledCenter(img, x, y, scale) {
+    if (!img || !img.complete || !img.naturalWidth) return;
+    const w = img.naturalWidth * scale;
+    const h = img.naturalHeight * scale;
+    ctx.drawImage(img, x - w / 2, y - h / 2, w, h);
   }
 
-  // 空闲等待甩竿
-  function drawIdle() {
-    drawWater();
-    drawFisherman();
-
-    // 提示
-    ctx.fillStyle = '#fff';
-    ctx.font = 'bold 24px sans-serif';
-    ctx.textAlign = 'center';
-    ctx.fillText('准备好了吗？', W / 2, 70);
-
-    ctx.fillStyle = 'rgba(255,255,255,0.5)';
-    ctx.font = '16px sans-serif';
-    ctx.fillText('按下 BTN / 空格键 甩竿', W / 2, 100);
-
-    // 动态鱼影（用Canvas绘制）
-    const fishX = W / 2 + Math.sin(f.frame * 0.015) * 150;
-    const fishY = H * 0.65 + Math.sin(f.frame * 0.02) * 20;
-    ctx.globalAlpha = 0.18;
-    const previewFish = FISH_DB[Math.floor(f.frame * 0.005) % FISH_DB.length];
-    drawFishBody(ctx, previewFish, fishX, fishY, 0.7, f.frame, Math.sin(f.frame * 0.015) > 0);
-    ctx.globalAlpha = 1;
-
-    // 连胜提示
-    if (f.streak > 0) {
-      ctx.fillStyle = '#ffd700';
-      ctx.font = 'bold 14px sans-serif';
-      ctx.fillText(`🔥 连续捕获 ${f.streak} 次`, W / 2, 130);
-    }
-  }
-
-  // 甩竿动画
-  function drawCasting() {
-    drawWater();
-    drawFisherman();
-
-    const prog = f.castAnim / 40;
-    ctx.fillStyle = '#fff';
-    ctx.font = 'bold 28px sans-serif';
-    ctx.textAlign = 'center';
-    if (prog < 0.5) {
-      ctx.fillText('甩竿中...', W / 2, H / 2 - 30);
-    } else {
-      ctx.fillText('落水！', W / 2, H / 2 - 30);
-      // 溅水效果
-      const splashAlpha = 1 - (prog - 0.5) * 2;
-      if (splashAlpha > 0) {
-        ctx.globalAlpha = splashAlpha;
-        ctx.font = '48px sans-serif';
-        ctx.fillText('💦', 300, H * 0.45 + 20);
-        ctx.globalAlpha = 1;
-      }
-    }
-  }
-
-  // 等待上钩
-  function drawWaiting() {
-    drawWater();
-    drawFisherman();
-
-    // 等待提示
-    const dots = '.'.repeat(1 + (Math.floor(f.frame / 30) % 3));
-    ctx.fillStyle = 'rgba(255,255,255,0.5)';
-    ctx.font = '20px sans-serif';
-    ctx.textAlign = 'center';
-    ctx.fillText(`等待鱼上钩${dots}`, W / 2, 70);
-
-    // 进度暗示（水下有鱼影接近）
-    const waitProg = f.waitTimer / f.waitDuration;
-    if (waitProg > 0.6) {
-      const shadowAlpha = (waitProg - 0.6) * 2.5 * 0.25;
-      ctx.globalAlpha = shadowAlpha;
-      const fx = 320 + Math.sin(f.frame * 0.05) * (50 * (1 - waitProg));
-      const fy = H * 0.55 + Math.sin(f.frame * 0.03) * 10;
-      const shadowFish = FISH_DB[Math.floor(Math.random() * 5)]; // 随机鱼影
-      drawFishBody(ctx, shadowFish, fx, fy, 0.5, f.frame, Math.sin(f.frame * 0.05) > 0);
-      ctx.globalAlpha = 1;
-    }
-
-    // 等待计时
-    const waitSec = ((f.waitDuration - f.waitTimer) / 60).toFixed(0);
-    ctx.fillStyle = 'rgba(255,255,255,0.2)';
-    ctx.font = '12px sans-serif';
-    ctx.fillText(`耐心等待...`, W / 2, H - 15);
-  }
-
-  // 上钩提示 — 展示鱼的Canvas绘制
-  function drawHooked() {
-    drawWater();
-    drawFisherman();
-
-    if (!f.currentFish) return;
-    const fish = f.currentFish;
-
-    // 大字 HOOKED!
-    const pulse = 0.8 + 0.2 * Math.sin(f.frame * 0.3);
+  function drawRotCenter(img, x, y, scale, deg) {
+    if (!img || !img.complete || !img.naturalWidth) return;
+    const w = img.naturalWidth * scale;
+    const h = img.naturalHeight * scale;
     ctx.save();
-    ctx.translate(W / 2, 60);
-    ctx.scale(pulse, pulse);
-    ctx.fillStyle = '#ff3333';
-    ctx.font = 'bold 48px sans-serif';
+    ctx.translate(x, y);
+    ctx.rotate((deg * Math.PI) / 180);
+    ctx.drawImage(img, -w / 2, -h / 2, w, h);
+    ctx.restore();
+  }
+
+  function drawFishingScene() {
+    const bg = imgs['钓鱼界面'];
+    if (bg && bg.complete) {
+      ctx.drawImage(bg, 0, 0, W, H);
+    } else {
+      ctx.fillStyle = '#87ceeb';
+      ctx.fillRect(0, 0, W, H);
+    }
+
+    if (state.catMoving) {
+      const cw = state.showWalk1 ? imgs['呆猫走路1'] : imgs['呆猫走路2'];
+      drawScaledCenter(cw, layout.catX, state.catY, state.catScale * sy);
+    } else {
+      drawScaledCenter(imgs['呆猫钓鱼姿势'], layout.catX, state.catY, 0.5 * sy);
+      if (state.baitVisible) {
+        ctx.save();
+        ctx.strokeStyle = '#ff2d2d';
+        ctx.lineWidth = Math.max(1.1, 1.15 * ((sx + sy) / 2));
+        ctx.lineCap = 'round';
+        ctx.shadowColor = 'rgba(255, 255, 255, 0.85)';
+        ctx.shadowBlur = 2 * ((sx + sy) / 2);
+        ctx.beginPath();
+        ctx.moveTo(layout.rodTopX, layout.rodTopY);
+        ctx.lineTo(state.baitX, state.baitY);
+        ctx.stroke();
+        ctx.restore();
+        if (state.baitMoving) {
+          drawScaledCenter(imgs['鱼饵'], state.baitX, state.baitY, 1 * sy);
+        } else {
+          ctx.fillStyle = '#ff0000';
+          ctx.beginPath();
+          ctx.arc(state.baitTargetX, state.baitTargetY, 5 * sx, 0, Math.PI * 2);
+          ctx.fill();
+        }
+      }
+    }
+
+    drawScaledCenter(imgs['鱼数量'], layout.fishCountBoard.x, layout.fishCountBoard.y, sy);
+    drawScaledCenter(imgs['鱼重量'], layout.fishWeightBoard.x, layout.fishWeightBoard.y, sy);
+    drawScaledCenter(imgs['次数看板'], layout.countBoard.x, layout.countBoard.y, sy);
+
+    ctx.fillStyle = 'rgb(54,27,0)';
+    ctx.font = `${Math.round(28 * sy)}px sans-serif`;
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
-    ctx.fillText('上钩了！', 0, 0);
-    ctx.restore();
+    ctx.fillText(String(state.castCount), layout.castTextLeft.x, layout.castTextLeft.y);
+    ctx.fillText(String(maxCasts), layout.castTextRight.x, layout.castTextRight.y);
+    ctx.fillText(String(state.fishCount), layout.numFish.x, layout.numFish.y);
+    ctx.fillText(`${state.fishWeight.toFixed(2)}kg`, layout.numKg.x, layout.numKg.y);
 
-    // 稀有度光环
-    const glowR = 80 + 20 * Math.sin(f.frame * 0.05);
-    const rarityCol = RARITY_COLORS[fish.rarity];
-    const glow = ctx.createRadialGradient(W / 2, H / 2 - 10, 10, W / 2, H / 2 - 10, glowR);
-    glow.addColorStop(0, rarityCol + '40');
-    glow.addColorStop(1, 'transparent');
-    ctx.fillStyle = glow;
-    ctx.fillRect(W / 2 - glowR, H / 2 - 10 - glowR, glowR * 2, glowR * 2);
-
-    // 鱼的大展示（居中）
-    const showScale = 2.0 + SIZE_MULTIPLIERS[f.currentSize] * 0.5;
-    const bounce = Math.sin(f.hookedTimer * 0.08) * 5;
-    drawFishBody(ctx, fish, W / 2, H / 2 - 10 + bounce, showScale, f.frame, false);
-
-    // 鱼名称
-    ctx.fillStyle = rarityCol;
-    ctx.font = 'bold 22px sans-serif';
-    ctx.textAlign = 'center';
-    ctx.fillText(`${fish.name} [${SIZE_LABELS[f.currentSize]}]`, W / 2, H / 2 + 70);
-
-    // 稀有度 + 拉力
-    ctx.fillStyle = 'rgba(255,255,255,0.6)';
-    ctx.font = '14px sans-serif';
-    ctx.fillText(
-      `${fish.rarity}  ·  拉力 ${(fish.basePull * SIZE_MULTIPLIERS[f.currentSize]).toFixed(0)}`,
-      W / 2, H / 2 + 92
-    );
+    if (state.showRotationText) {
+      const swingDeg = 18 * Math.sin(state.fishBiteSwing);
+      state.fishBiteSwing += 0.12;
+      drawRotCenter(imgs['鱼儿咬钩'], layout.hintPos.x, layout.hintPos.y, sy, swingDeg);
+      if (state.rotationTextBlink) {
+        const rem = Math.max(0, state.requiredRotations - state.motorRotations);
+        ctx.fillStyle = '#ff0000';
+        ctx.font = `bold ${Math.round(30 * sy)}px sans-serif`;
+        ctx.fillText(` ${rem.toFixed(2)}`, layout.rotText.x, layout.rotText.y);
+      }
+      drawScaledCenter(imgs['倒计时'], layout.cdPos.x, layout.cdPos.y, sy);
+      const now = performance.now() / 1000;
+      const remS = Math.max(0, state.fishEscapeAt - now);
+      ctx.fillStyle = '#ff0000';
+      ctx.font = `bold ${Math.round(24 * sy)}px sans-serif`;
+      ctx.fillText(`${remS.toFixed(2)}s`, layout.cdText.x, layout.cdText.y);
+    }
   }
 
-  // 对抗期 UI — 3 回合制
-  function drawFighting() {
-    drawWater();
-    drawFisherman();
-
-    const fish = f.currentFish;
-    if (!fish) return;
-
-    const zoneColors = { red: '#e53935', yellow: '#fbc02d', green: '#43a047' };
-
-    // === 顶部：3 步进度指示 ===
-    const stepY = 25;
-    const stepSize = 50;
-    const stepGap = 30;
-    const totalW = stepSize * 3 + stepGap * 2;
-    const stepStartX = W / 2 - totalW / 2;
-
+  function drawDataDashboard() {
+    drawScaledCenter(imgs['数据看板'], layout.dataDash.x, layout.dataDash.y, sy);
+    const avg = state.fishCount > 0 ? state.fishWeight / state.fishCount : 0;
+    ctx.fillStyle = 'rgb(54,27,0)';
+    ctx.font = `${Math.round(26 * sy)}px sans-serif`;
     ctx.textAlign = 'center';
+    ctx.fillText(`${state.fishWeight.toFixed(2)}kg`, layout.dashTotalKg.x, layout.dashTotalKg.y);
+    ctx.fillText(`${avg.toFixed(2)}kg`, layout.dashAvgKg.x, layout.dashAvgKg.y);
+  }
 
-    for (let i = 0; i < 3; i++) {
-      const cx = stepStartX + i * (stepSize + stepGap) + stepSize / 2;
-      const cy = stepY + stepSize / 2;
-
-      if (i < f.correctCount) {
-        // ✅ 已完成
-        ctx.fillStyle = 'rgba(67,160,71,0.3)';
-        ctx.beginPath();
-        ctx.arc(cx, cy, stepSize / 2, 0, Math.PI * 2);
-        ctx.fill();
-        ctx.strokeStyle = '#43a047';
-        ctx.lineWidth = 3;
-        ctx.stroke();
-        ctx.fillStyle = '#43a047';
-        ctx.font = 'bold 28px sans-serif';
-        ctx.fillText('✓', cx, cy + 10);
-      } else if (i === f.correctCount) {
-        // 🔵 当前回合
-        const pulse = 0.8 + 0.2 * Math.sin(f.frame * 0.1);
-        ctx.fillStyle = `rgba(33,150,243,${0.15 * pulse})`;
-        ctx.beginPath();
-        ctx.arc(cx, cy, stepSize / 2 * pulse, 0, Math.PI * 2);
-        ctx.fill();
-        ctx.strokeStyle = zoneColors[f.zoneType];
-        ctx.lineWidth = 3;
-        ctx.beginPath();
-        ctx.arc(cx, cy, stepSize / 2, 0, Math.PI * 2);
-        ctx.stroke();
-        // 圆内数字
-        ctx.fillStyle = '#fff';
-        ctx.font = 'bold 22px sans-serif';
-        ctx.fillText(String(i + 1), cx, cy + 8);
-      } else {
-        // ⬜ 未到达
-        ctx.fillStyle = 'rgba(255,255,255,0.08)';
-        ctx.beginPath();
-        ctx.arc(cx, cy, stepSize / 2, 0, Math.PI * 2);
-        ctx.fill();
-        ctx.strokeStyle = 'rgba(255,255,255,0.2)';
-        ctx.lineWidth = 1.5;
-        ctx.stroke();
-        ctx.fillStyle = 'rgba(255,255,255,0.3)';
-        ctx.font = '20px sans-serif';
-        ctx.fillText(String(i + 1), cx, cy + 7);
-      }
-
-      // 步骤之间的连接线
-      if (i < 2) {
-        const x1 = cx + stepSize / 2 + 4;
-        const x2 = stepStartX + (i + 1) * (stepSize + stepGap) + stepSize / 2 - stepSize / 2 - 4;
-        ctx.strokeStyle = i < f.correctCount ? '#43a047' : 'rgba(255,255,255,0.15)';
-        ctx.lineWidth = 2;
-        ctx.beginPath();
-        ctx.moveTo(x1, cy);
-        ctx.lineTo(x2, cy);
-        ctx.stroke();
-      }
-    }
-
-    // 标题
-    ctx.fillStyle = '#fff';
-    ctx.font = 'bold 13px sans-serif';
-    ctx.textAlign = 'center';
-    ctx.fillText(`第 ${f.correctCount + 1} / 3 回合`, W / 2, stepY + stepSize + 20);
-
-    // === 当前操作区域指示（大字） ===
-    const zoneY = stepY + stepSize + 36;
-
-    // 本轮结果展示
-    if (f.roundState === 'success') {
-      const alpha = Math.min(1, f.roundResultTimer / 30);
-      ctx.fillStyle = `rgba(67,160,71,${alpha * 0.3})`;
-      ctx.beginPath();
-      ctx.roundRect(W / 2 - 150, zoneY - 5, 300, 50, 12);
-      ctx.fill();
-      ctx.fillStyle = '#43a047';
-      ctx.font = 'bold 26px sans-serif';
-      ctx.fillText('✅ 成功！', W / 2, zoneY + 30);
-    } else if (f.roundState === 'fail') {
-      const alpha = Math.min(1, f.roundResultTimer / 30);
-      ctx.fillStyle = `rgba(229,57,53,${alpha * 0.3})`;
-      ctx.beginPath();
-      ctx.roundRect(W / 2 - 150, zoneY - 5, 300, 50, 12);
-      ctx.fill();
-      ctx.fillStyle = '#e53935';
-      ctx.font = 'bold 26px sans-serif';
-      ctx.fillText('❌ 失败，再试！', W / 2, zoneY + 30);
-    } else {
-      // 判定中：显示当前区域操作提示
-      const zoneInfo = {
-        green: { icon: '🟢', label: '快速转动电机！', sub: '用力快速转动', color: '#43a047' },
-        yellow: { icon: '🟡', label: '慢慢转动电机', sub: '轻柔慢速转动', color: '#fbc02d' },
-        red: { icon: '🔴', label: '反向/停止转动', sub: '反转或停下来', color: '#e53935' },
-      };
-      const info = zoneInfo[f.zoneType];
-
-      // 区域颜色背景
-      const pulse = 0.15 + 0.08 * Math.sin(f.frame * 0.08);
-      ctx.fillStyle = info.color + Math.floor(pulse * 255).toString(16).padStart(2, '0');
-      ctx.beginPath();
-      ctx.roundRect(W / 2 - 180, zoneY - 5, 360, 55, 12);
-      ctx.fill();
-      ctx.strokeStyle = info.color;
-      ctx.lineWidth = 2;
-      ctx.beginPath();
-      ctx.roundRect(W / 2 - 180, zoneY - 5, 360, 55, 12);
-      ctx.stroke();
-
+  function drawFrame() {
+    if (!assetsReady) {
+      ctx.fillStyle = '#1a1a2e';
+      ctx.fillRect(0, 0, W, H);
       ctx.fillStyle = '#fff';
-      ctx.font = 'bold 22px sans-serif';
-      ctx.fillText(`${info.icon} ${info.label}`, W / 2, zoneY + 22);
-      ctx.fillStyle = 'rgba(255,255,255,0.6)';
-      ctx.font = '13px sans-serif';
-      ctx.fillText(info.sub, W / 2, zoneY + 42);
+      ctx.font = '18px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText('加载钓鱼达人素材…', W / 2, H / 2);
+      return;
+    }
 
-      // 倒计时条
-      const cdY2 = zoneY + 56;
-      const cdW = 360;
-      const cdProg = Math.max(0, f.zoneTimer / f.zoneDuration);
-      ctx.fillStyle = 'rgba(0,0,0,0.3)';
-      ctx.beginPath();
-      ctx.roundRect(W / 2 - cdW / 2, cdY2, cdW, 6, 3);
-      ctx.fill();
-      // 倒计时不足 25% 时闪红
-      const cdColor = cdProg < 0.25 ? (Math.sin(f.frame * 0.2) > 0 ? '#f44336' : '#ff9800') : info.color;
-      ctx.fillStyle = cdColor + 'cc';
-      ctx.beginPath();
-      ctx.roundRect(W / 2 - cdW / 2, cdY2, cdW * cdProg, 6, 3);
-      ctx.fill();
-
-      // 匹配度反馈
-      const matchVal = f.speedMatchDisplay;
-      let matchText, matchColor;
-      if (matchVal > 0.6) {
-        matchText = '✨ 完美！继续保持！';
-        matchColor = '#4caf50';
-      } else if (matchVal > 0.3) {
-        matchText = '👍 不错！';
-        matchColor = '#8bc34a';
-      } else if (matchVal > 0) {
-        matchText = '🤏 再努力一点';
-        matchColor = '#ffc107';
-      } else {
-        matchText = '⚠️ 操作不对！';
-        matchColor = '#f44336';
+    if (state.gameState === 'start') {
+      const sbg = imgs['开始界面'];
+      if (sbg && sbg.complete) ctx.drawImage(sbg, 0, 0, W, H);
+      else ctx.fillRect(0, 0, W, H);
+      const b1 = imgs['开始钓鱼1'];
+      const b2 = imgs['开始钓鱼2'];
+      if (state.showFirstImage) drawScaledCenter(b1, layout.startFishBtn.x, layout.startFishBtn.y, sy);
+      else drawScaledCenter(b2, layout.startFishBtn.x, layout.startFishBtn.y, sy);
+    } else if (state.gameState === 'fishing') {
+      drawFishingScene();
+    } else if (state.gameState === 'result') {
+      drawFishingScene();
+      const ov = imgs['结算界面蒙层'];
+      if (ov && ov.complete) ctx.drawImage(ov, 0, 0, W, H);
+      else {
+        ctx.fillStyle = 'rgba(0,0,0,0.45)';
+        ctx.fillRect(0, 0, W, H);
       }
-
-      ctx.fillStyle = matchColor;
-      ctx.font = 'bold 15px sans-serif';
-      ctx.fillText(matchText, W / 2, cdY2 + 24);
-    }
-
-    // 鱼名称 + 稀有度
-    const infoY = zoneY + 96;
-    ctx.fillStyle = RARITY_COLORS[fish.rarity];
-    ctx.font = 'bold 16px sans-serif';
-    ctx.textAlign = 'center';
-    ctx.fillText(`${fish.name} [${SIZE_LABELS[f.currentSize]}]`, W / 2, infoY);
-    ctx.fillStyle = 'rgba(255,255,255,0.4)';
-    ctx.font = '12px sans-serif';
-    ctx.fillText(fish.rarity, W / 2, infoY + 16);
-
-    // === 水下鱼的Canvas绘制 ===
-    const fishX = W / 2 + Math.sin(f.frame * 0.04) * 80;
-    const fishBaseY = H * 0.68;
-    const fishY = fishBaseY + Math.cos(f.frame * 0.03) * 12;
-    const fishScale = (0.8 + SIZE_MULTIPLIERS[f.currentSize] * 0.5) * (1 + (1 - f.correctCount / 3) * 0.2);
-    const flipX = Math.sin(f.frame * 0.04) > 0;
-    drawFishBody(ctx, fish, fishX, fishY, fishScale, f.frame, flipX);
-
-    // 操作提示（底部）
-    ctx.fillStyle = 'rgba(255,255,255,0.3)';
-    ctx.font = '12px sans-serif';
-    ctx.textAlign = 'center';
-    const tipByZone = {
-      green: '🟢 快速转动电机！(空格/↑ 连按)',
-      yellow: '🟡 慢慢转动电机 (轻按空格)',
-      red: '🔴 反方向转动或停止！(↓ / 反转)'
-    };
-    ctx.fillText(tipByZone[f.zoneType], W / 2, H - 10);
-  }
-
-  // 成功捕获 — 大鱼展示
-  function drawCaught() {
-    drawWater();
-
-    if (!f.currentFish) return;
-    const fish = f.currentFish;
-    const rarityCol = RARITY_COLORS[fish.rarity];
-
-    // 庆祝效果
-    const alpha = Math.min(1, f.resultTimer / 30);
-    ctx.globalAlpha = alpha;
-
-    // 背景高亮
-    ctx.fillStyle = 'rgba(255,215,0,0.08)';
-    ctx.fillRect(0, 0, W, H);
-
-    // 粒子效果
-    if (f.resultTimer < 90) {
-      for (let i = 0; i < 6; i++) {
-        const angle = (f.resultTimer * 0.05 + i * Math.PI / 3);
-        const dist = 50 + f.resultTimer * 1.2;
-        const px = W / 2 + Math.cos(angle) * dist;
-        const py = H / 2 - 30 + Math.sin(angle) * dist * 0.6;
-        const pAlpha = 1 - f.resultTimer / 90;
-        ctx.fillStyle = `rgba(255,215,0,${pAlpha * 0.6})`;
-        ctx.beginPath();
-        ctx.arc(px, py, 3 + Math.random() * 2, 0, Math.PI * 2);
-        ctx.fill();
-      }
-    }
-
-    // 稀有度光环
-    const glowR = 100 + 30 * Math.sin(f.frame * 0.04);
-    const glow = ctx.createRadialGradient(W / 2, H / 2 - 40, 15, W / 2, H / 2 - 40, glowR);
-    glow.addColorStop(0, rarityCol + '50');
-    glow.addColorStop(0.6, rarityCol + '15');
-    glow.addColorStop(1, 'transparent');
-    ctx.fillStyle = glow;
-    ctx.fillRect(W / 2 - glowR - 20, H / 2 - 40 - glowR, (glowR + 20) * 2, glowR * 2);
-
-    // 大鱼展示
-    const showScale = 2.5 + SIZE_MULTIPLIERS[f.currentSize] * 0.6;
-    const floatY = Math.sin(f.frame * 0.04) * 6;
-    drawFishBody(ctx, fish, W / 2, H / 2 - 40 + floatY, showScale, f.frame, false);
-
-    // 标题
-    ctx.fillStyle = '#ffd700';
-    ctx.font = 'bold 32px sans-serif';
-    ctx.textAlign = 'center';
-    ctx.fillText('捕获成功！', W / 2, 50);
-
-    // 鱼名称
-    ctx.fillStyle = rarityCol;
-    ctx.font = 'bold 24px sans-serif';
-    ctx.fillText(`${fish.name}`, W / 2, H / 2 + 55);
-
-    // 大小 + 稀有度
-    ctx.fillStyle = 'rgba(255,255,255,0.6)';
-    ctx.font = '15px sans-serif';
-    ctx.fillText(`${SIZE_LABELS[f.currentSize]}型  ·  ${fish.rarity}`, W / 2, H / 2 + 78);
-
-    // 是否新物种
-    const fishId = String(fish.id);
-    if (collection[fishId] && collection[fishId].count === 1) {
-      ctx.fillStyle = '#ff1744';
-      ctx.font = 'bold 18px sans-serif';
-      ctx.fillText('★ 新物种发现！★', W / 2, H / 2 + 105);
-    }
-
-    if (fish.secret) {
-      ctx.fillStyle = '#ffd700';
-      ctx.font = 'bold 16px sans-serif';
-      ctx.fillText('✨ 超级稀有彩蛋鱼！✨', W / 2, H / 2 + (collection[fishId]?.count === 1 ? 128 : 105));
-    }
-
-    ctx.globalAlpha = 1;
-
-    if (f.resultTimer > 60) {
-      ctx.fillStyle = 'rgba(255,255,255,0.4)';
-      ctx.font = '14px sans-serif';
-      ctx.fillText('按 BTN / Enter 继续钓鱼', W / 2, H - 16);
-    }
-  }
-
-  // 逃跑 — 鱼游走动画
-  function drawEscaped() {
-    drawWater();
-    drawFisherman();
-
-    if (!f.currentFish) return;
-    const fish = f.currentFish;
-
-    const alpha = Math.min(1, f.resultTimer / 30);
-    ctx.globalAlpha = alpha;
-
-    ctx.fillStyle = '#ff5252';
-    ctx.font = 'bold 34px sans-serif';
-    ctx.textAlign = 'center';
-    ctx.fillText('鱼逃跑了...', W / 2, 60);
-
-    // 鱼游走动画（从中间往右跑）
-    const escapeX = W / 2 + Math.min(f.resultTimer * 2.5, W * 0.35);
-    const escapeY = H * 0.6 + Math.sin(f.frame * 0.06) * 10;
-    const escapeAlpha = Math.max(0, 1 - f.resultTimer / 120);
-    const escScale = 1.5 + SIZE_MULTIPLIERS[f.currentSize] * 0.3;
-    ctx.globalAlpha = escapeAlpha * alpha;
-    drawFishBody(ctx, fish, escapeX, escapeY, escScale, f.frame, true);
-    ctx.globalAlpha = alpha;
-
-    // 鱼名称
-    ctx.fillStyle = RARITY_COLORS[fish.rarity];
-    ctx.font = '18px sans-serif';
-    ctx.textAlign = 'center';
-    ctx.fillText(
-      `${fish.name} [${SIZE_LABELS[f.currentSize]}] 挣脱了鱼线`,
-      W / 2, H / 2 + 40
-    );
-
-    ctx.globalAlpha = 1;
-
-    if (f.resultTimer > 60) {
-      ctx.fillStyle = 'rgba(255,255,255,0.4)';
-      ctx.font = '14px sans-serif';
-      ctx.fillText('按 BTN / Enter 再试一次', W / 2, H - 16);
-    }
-  }
-
-  // 图鉴
-  function drawCatalog() {
-    ctx.fillStyle = '#0a1628';
-    ctx.fillRect(0, 0, W, H);
-
-    ctx.fillStyle = '#fff';
-    ctx.font = 'bold 28px sans-serif';
-    ctx.textAlign = 'center';
-    ctx.fillText('📖 鱼类图鉴', W / 2, 40);
-
-    const unlocked = Object.keys(collection).length;
-    ctx.fillStyle = 'rgba(255,255,255,0.4)';
-    ctx.font = '14px sans-serif';
-    ctx.fillText(`已收集 ${unlocked} / ${FISH_DB.length} 种`, W / 2, 62);
-
-    // 分页
-    const startIdx = f.catalogPage * f.catalogPerPage;
-    const endIdx = Math.min(startIdx + f.catalogPerPage, FISH_DB.length);
-    const totalPages = Math.ceil(FISH_DB.length / f.catalogPerPage);
-
-    // 卡片网格 (2列 x 5行)
-    const cols = 2, cardW = 340, cardH = 42, gapX = 20, gapY = 8;
-    const gridX = (W - (cols * cardW + (cols - 1) * gapX)) / 2;
-    const gridY = 80;
-
-    for (let i = startIdx; i < endIdx; i++) {
-      const fish = FISH_DB[i];
-      const localIdx = i - startIdx;
-      const col = localIdx % cols;
-      const row = Math.floor(localIdx / cols);
-      const cx = gridX + col * (cardW + gapX);
-      const cy = gridY + row * (cardH + gapY);
-
-      const fishId = String(fish.id);
-      const isUnlocked = !!collection[fishId];
-
-      // 卡片背景
-      ctx.fillStyle = isUnlocked ? RARITY_BG[fish.rarity] : 'rgba(255,255,255,0.03)';
-      ctx.beginPath();
-      ctx.roundRect(cx, cy, cardW, cardH, 6);
-      ctx.fill();
-
-      // 边框
-      ctx.strokeStyle = isUnlocked ? (RARITY_COLORS[fish.rarity] + '60') : 'rgba(255,255,255,0.08)';
-      ctx.lineWidth = 1;
-      ctx.stroke();
-
-      if (isUnlocked) {
-        // 鱼的迷你Canvas绘制
-        drawFishBody(ctx, fish, cx + 20, cy + cardH / 2, 0.35, f.frame, false);
-
-        // 名称
-        ctx.fillStyle = RARITY_COLORS[fish.rarity];
-        ctx.font = 'bold 14px sans-serif';
-        ctx.textAlign = 'left';
-        ctx.fillText(fish.name, cx + 42, cy + 18);
-
-        // 稀有度
-        ctx.fillStyle = 'rgba(255,255,255,0.4)';
-        ctx.font = '11px sans-serif';
-        ctx.fillText(fish.rarity, cx + 42, cy + 34);
-
-        // 捕获次数
-        const info = collection[fishId];
-        ctx.textAlign = 'right';
-        ctx.fillStyle = 'rgba(255,255,255,0.5)';
-        ctx.font = '12px sans-serif';
-        ctx.fillText(`×${info.count}`, cx + cardW - 10, cy + 18);
-        if (info.maxSize >= 0) {
-          ctx.fillText(`最大: ${SIZE_LABELS[info.maxSize]}`, cx + cardW - 10, cy + 34);
+      if (state.viewDataState === 'normal') {
+        if (state.castCount >= maxCasts) {
+          if (state.showFirstImage) drawScaledCenter(imgs['查看数据1'], layout.startFishBtn.x, layout.startFishBtn.y, sy);
+          else drawScaledCenter(imgs['查看数据2'], layout.startFishBtn.x, layout.startFishBtn.y, sy);
+        } else {
+          if (state.showFirstImage) drawScaledCenter(imgs['继续钓鱼1'], layout.startFishBtn.x, layout.startFishBtn.y, sy);
+          else drawScaledCenter(imgs['继续钓鱼2'], layout.startFishBtn.x, layout.startFishBtn.y, sy);
+        }
+        if (state.currentFishType) {
+          const fc = imgs[state.currentFishType];
+          drawScaledCenter(fc, layout.fishCard.x, layout.fishCard.y, sy);
         }
       } else {
-        // 未解锁暗影
-        ctx.fillStyle = 'rgba(255,255,255,0.08)';
-        ctx.font = '20px sans-serif';
-        ctx.textAlign = 'left';
-        ctx.fillText('❓', cx + 10, cy + 28);
-        ctx.font = '14px sans-serif';
-        ctx.fillText(fish.secret ? '??? (彩蛋)' : '???', cx + 38, cy + 25);
+        drawDataDashboard();
       }
     }
 
-    // 翻页
-    ctx.textAlign = 'center';
-    ctx.fillStyle = 'rgba(255,255,255,0.5)';
-    ctx.font = '14px sans-serif';
-    ctx.fillText(`第 ${f.catalogPage + 1} / ${totalPages} 页`, W / 2, H - 30);
-    ctx.fillText('← → / 摇杆翻页  |  Enter / BTN 返回', W / 2, H - 12);
+    ctx.fillStyle = 'rgba(0,0,0,0.35)';
+    ctx.font = `${Math.round(12 * sy)}px sans-serif`;
+    ctx.textAlign = 'left';
+    ctx.fillText('串口：摇晃控制器开始 / 继续 · ANGLE| 或 DEGREE: 卷线 · 空格模拟', 8, H - 8);
   }
 
-  // === 主渲染循环 ===
-  function gameLoop() {
-    gameAnimationId = requestAnimationFrame(gameLoop);
+  function update(nowMs) {
+    const dt = Math.min(50, nowMs - state.lastFrameMs);
+    state.lastFrameMs = nowMs;
+    const nowSec = nowMs / 1000;
 
-    update();
-
-    ctx.save();
-    ctx.translate(f.shakeX, f.shakeY);
-
-    switch (f.mode) {
-      case 'menu': drawMenu(); break;
-      case 'idle': drawIdle(); break;
-      case 'casting': drawCasting(); break;
-      case 'waiting': drawWaiting(); break;
-      case 'hooked': drawHooked(); break;
-      case 'fighting': drawFighting(); break;
-      case 'caught': drawCaught(); break;
-      case 'escaped': drawEscaped(); break;
-      case 'catalog': drawCatalog(); break;
+    state.blinkPhase += dt;
+    if (state.blinkPhase >= 500) {
+      state.blinkPhase = 0;
+      state.showFirstImage = !state.showFirstImage;
     }
 
-    ctx.restore();
+    if (state.gameState === 'fishing' && state.catMoving) {
+      const step = 2 * (dt / (1000 / 60)) * sy;
+      state.catY -= step;
+      const progress = (layout.startY - state.catY) / (layout.startY - layout.targetY);
+      state.catScale = 1 - progress * 0.5;
+      state.walkPhase += dt;
+      if (state.walkPhase >= 166) {
+        state.walkPhase = 0;
+        state.showWalk1 = !state.showWalk1;
+      }
+      if (state.catY <= layout.targetY) {
+        state.catY = layout.targetY;
+        state.catMoving = false;
+        state.showWalk1 = false;
+        state.catScale = 0.5;
+        state.baitX = layout.rodTopX;
+        state.baitY = layout.rodTopY;
+        const land = pickBaitLanding();
+        state.baitTargetX = land.x;
+        state.baitTargetY = land.y;
+        state.baitMoving = true;
+        state.baitVisible = true;
+        state.castCount += 1;
+        fishingV2PlaySfx('甩杆声音');
+        state.splashPlayed = false;
+      }
+    }
+
+    if (state.gameState === 'fishing' && state.baitMoving) {
+      const dx = state.baitTargetX - state.baitX;
+      const dy = state.baitTargetY - state.baitY;
+      const dist = Math.sqrt(dx * dx + dy * dy) || 1;
+      const step = state.baitSpeed * (dt / (1000 / 60));
+      if (dist > step) {
+        state.baitX += (dx / dist) * step;
+        state.baitY += (dy / dist) * step;
+      } else {
+        state.baitX = state.baitTargetX;
+        state.baitY = state.baitTargetY;
+        state.baitMoving = false;
+        if (!state.splashPlayed) {
+          fishingV2PlaySfx('鱼饵落水');
+          state.splashPlayed = true;
+        }
+        if (!state.fishBiting) {
+          state.fishBiting = true;
+          state.fishBiteAt = nowSec + 4 + Math.random() * 6;
+        }
+      }
+    }
+
+    if (state.gameState === 'fishing' && state.fishBiting && state.fishBiteAt > 0 && nowSec >= state.fishBiteAt) {
+      if (!state.showRotationText && !state.fishEscaped) {
+        state.requiredRotations = 2 + Math.floor(Math.random() * 4);
+        state.showRotationText = true;
+        state.rotationTextBlink = true;
+        state.rotationBlinkT = 0;
+        state.fishEscapeAt = nowSec + 3 + Math.random() * 2;
+        state.angleRefDeg = state.motorRawDeg;
+        state.motorRotations = 0;
+        fishingV2SendHardware('FISH_BITE_START');
+        fishingV2PlaySfx('有鱼上钩');
+      }
+    }
+
+    if (state.showRotationText) {
+      state.rotationBlinkT += dt;
+      if (state.rotationBlinkT >= 250) {
+        state.rotationBlinkT = 0;
+        state.rotationTextBlink = !state.rotationTextBlink;
+      }
+    }
+
+    if (state.gameState === 'fishing' && state.showRotationText && !state.fishEscaped && nowSec >= state.fishEscapeAt) {
+      state.fishEscaped = true;
+      state.showRotationText = false;
+      fishingV2PlaySfx('鱼儿跑掉');
+      if (state.castCount < maxCasts) {
+        state.fishBiting = false;
+        state.fishBiteAt = 0;
+        state.fishEscaped = false;
+        state.baitX = layout.rodTopX;
+        state.baitY = layout.rodTopY;
+        const land = pickBaitLanding();
+        state.baitTargetX = land.x;
+        state.baitTargetY = land.y;
+        state.baitMoving = true;
+        state.baitVisible = true;
+        state.castCount += 1;
+        fishingV2PlaySfx('甩杆声音');
+        state.splashPlayed = false;
+        fishingV2SendHardware('RESET');
+      } else {
+        state.fishBiting = false;
+        state.fishBiteAt = 0;
+        state.fishEscaped = false;
+        state.gameState = 'result';
+        state.viewDataState = 'data_dashboard';
+        state.currentFishType = null;
+        fishingV2SendHardware('RESET');
+      }
+    }
+
+    if (nowSec - state.lastJumpAt > 1 && state.gyroJump) {
+      state.gyroJump = false;
+      state.lastJumpAt = nowSec;
+      if (state.gameState === 'start') {
+        beginFromStartScreen();
+      } else if (state.gameState === 'result' && state.viewDataState === 'normal') {
+        onResultGyroShakeFromParent();
+      }
+    }
+
+    if (state.gameState === 'fishing' && !state.catMoving && state.showRotationText) {
+      if (state.keySimRot !== 0) {
+        state.motorRawDeg += state.keySimRot * 4.5 * (dt / (1000 / 60));
+        updateMotorFromRaw(state.motorRawDeg);
+      }
+      if (state.motorRotations >= state.requiredRotations) {
+        state.gameState = 'result';
+        state.viewDataState = 'normal';
+        state.currentFishType = FISHING_V2_FISH_TYPES[Math.floor(Math.random() * FISHING_V2_FISH_TYPES.length)];
+        state.fishCount += 1;
+        state.fishWeight += FISHING_V2_FISH_WEIGHTS[state.currentFishType];
+        fishingV2PlaySfx('成功音效');
+        fishingV2SendHardware('FISH_CAUGHT');
+        state.motorRawDeg = 0;
+        state.angleRefDeg = 0;
+        state.motorRotations = 0;
+        resetBaitState();
+        state.fishEscaped = false;
+        fishingV2SendHardware('RESET');
+      }
+    }
   }
 
-  gameLoop();
+  gameState.fishing = state;
+
+  window._fishingHandleDirection = function () {};
+  window._fishingHandleButton = function (pressed, source) {
+    if (source !== 'port1' || !pressed) return;
+    if (state.gameState === 'result' && state.viewDataState === 'normal') {
+      state.gyroJump = true;
+    }
+  };
+  window._fishingHandleDegree = function (value, source) {
+    if (source !== 'port1') return;
+    updateMotorFromRaw(value);
+  };
+  window._fishingHandleRawJoy = function () {};
+  window._fishingHandleFishCast = function (source) {
+    if (source !== 'port1') return;
+    state.gyroJump = true;
+  };
+  window._fishingHandleFishReel = function (delta, source) {
+    if (source !== 'port1' || state.gameState !== 'fishing') return;
+    if (!state.catMoving && state.showRotationText) {
+      state.motorRawDeg += delta;
+      updateMotorFromRaw(state.motorRawDeg);
+    }
+  };
+  window._fishingHandleFishShake = function () {};
+  window._fishingHandleMotorRawDeg = function (rawDeg, source) {
+    if (source !== 'port1') return;
+    updateMotorFromRaw(rawDeg);
+  };
+  window._fishingHandleGyroShake = function (source) {
+    if (source !== 'port1') return;
+    state.gyroJump = true;
+  };
+
+  function onKeyDown(e) {
+    if (currentGame !== 'fishing') return;
+    const k = e.key;
+    if (k === 'a' || k === 'A' || k === 'ArrowLeft') state.keySimRot = -1;
+    if (k === 'd' || k === 'D' || k === 'ArrowRight') state.keySimRot = 1;
+    if (k === ' ' || k === 'Enter') {
+      state.gyroJump = true;
+      if (state.gameState === 'result' && state.viewDataState === 'data_dashboard') {
+        state.gameState = 'start';
+        state.viewDataState = 'normal';
+        state.castCount = 0;
+        state.fishCount = 0;
+        state.fishWeight = 0;
+        state.currentFishType = null;
+        resetBaitState();
+        state.catY = layout.startY;
+        fishingV2SendHardware('RESET');
+      }
+    }
+  }
+  function onKeyUp(e) {
+    if (currentGame !== 'fishing') return;
+    const k = e.key;
+    if (k === 'a' || k === 'A' || k === 'ArrowLeft' || k === 'd' || k === 'D' || k === 'ArrowRight') state.keySimRot = 0;
+  }
+
+  document.addEventListener('keydown', onKeyDown);
+  document.addEventListener('keyup', onKeyUp);
+  gameState._jumpCleanup = function () {
+    document.removeEventListener('keydown', onKeyDown);
+    document.removeEventListener('keyup', onKeyUp);
+    if (bgm) {
+      bgm.pause();
+      bgm.currentTime = 0;
+    }
+  };
+
+  if (gameAnimationId) cancelAnimationFrame(gameAnimationId);
+
+  function loop() {
+    gameAnimationId = requestAnimationFrame(loop);
+    const t = performance.now();
+    update(t);
+    ctx.clearRect(0, 0, W, H);
+    drawFrame();
+  }
+
+  if (bgm) bgm.play().catch(() => {});
+  loop();
 }
 
 // === 钓鱼游戏串口外部处理函数（兼容现有路由模式） ===
@@ -6367,7 +6245,6 @@ function fishingHandleDirection(dir, source) {
 function fishingHandleButton(pressed, source) {
   if (window._fishingHandleButton) window._fishingHandleButton(pressed, source);
 }
-
 // ========== 🎯 体感平衡球 (Gyro Balance Ball) ==========
 function startGyroBalance() {
   const W = gameCanvas.width, H = gameCanvas.height;
@@ -8005,29 +7882,23 @@ function startPokemon() {
     } catch (e) {}
   }
 
-  // === 硬件震动反馈：向 P2 串口发送 MOTOR 指令 ===
+  // === 硬件震动反馈：向单控制器发送 MOTOR 指令 ===
   // 低血量逆时针慢转
   async function sendMotorLowHP() {
     try {
-      const sp = serialPorts.port2;
-      if (!sp || !sp.isConnected || !sp.port || !sp.port.writable) return;
-      const writer = sp.port.writable.getWriter();
-      const encoder = new TextEncoder();
-      await writer.write(encoder.encode('P2|MOTOR:CCW\n'));
-      writer.releaseLock();
+      const sp = serialPorts.port1;
+      if (!sp?.isConnected) return;
+      await writeToPort('port1', 'MOTOR:CCW\n');
     } catch (e) {}
   }
 
   async function sendMotorFeedback() {
     try {
-      const sp = serialPorts.port2;
-      if (!sp || !sp.isConnected || !sp.port || !sp.port.writable) return;
-      const writer = sp.port.writable.getWriter();
-      const encoder = new TextEncoder();
-      await writer.write(encoder.encode('P2|MOTOR:CW\n'));
-      writer.releaseLock();
+      const sp = serialPorts.port1;
+      if (!sp?.isConnected) return;
+      await writeToPort('port1', 'MOTOR:CW\n');
     } catch (e) {
-      // 串口未连接或写入失败，静默忽略
+      // 未连接或写入失败，静默忽略
     }
   }
 
@@ -8228,8 +8099,8 @@ function startPokemon() {
 
   // ===== 输入处理 =====
   function handleDirection(dir, source) {
-    // 只接受 P2 手柄（或键盘）
-    if (source && source !== 'port2') return;
+    // 只接受单控制器输入（或键盘）
+    if (source && source !== 'port1') return;
 
     // === 全局菜单导航（最高优先级） ===
     if (pkState.globalMenuOpen) {
@@ -8307,8 +8178,8 @@ function startPokemon() {
   }
 
   function handleButton(source) {
-    // 只接受 P2 手柄（或键盘）
-    if (source && source !== 'port2') return;
+    // 只接受单控制器输入（或键盘）
+    if (source && source !== 'port1') return;
 
     // === 全局菜单按键（最高优先级） ===
     if (pkState.globalMenuOpen) {
@@ -10542,7 +10413,7 @@ function startPokemon() {
       ctx.fillRect(W - 4, 0, 4, H);
     }
 
-    // P2 手柄提示
+    // 控制器提示
     ctx.fillStyle = '#f472b6';
     ctx.textAlign = 'right';
     ctx.font = '11px monospace';
@@ -13375,4 +13246,5 @@ window.toggleAutoScroll = toggleAutoScroll;
 window.toggleSerialOutput = toggleSerialOutput;
 window.openInNewWindow = openInNewWindow;
 window.toggleSerialPanel = toggleSerialPanel;
+window.toggleBleConnection = toggleBleConnection;
 window.serialPorts = serialPorts;

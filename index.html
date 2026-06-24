@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>星瀚体感游戏</title>
+  <title>星瀚外设网站</title>
   <link rel="stylesheet" href="./style.css">
 </head>
 <body>
@@ -19,8 +19,8 @@
       </div>
       <div class="iframe-notice-content">
         <h3>需要在新窗口中打开</h3>
-        <p>当前页面运行在嵌入式框架（iframe）中，浏览器安全策略禁止在此环境下访问串口设备。</p>
-        <p class="iframe-notice-hint">请点击下方按钮，在独立窗口中打开本页面，即可正常使用串口功能。</p>
+        <p>当前页面运行在嵌入式框架（iframe）中，浏览器安全策略禁止在此环境下访问串口与蓝牙设备。</p>
+        <p class="iframe-notice-hint">请点击下方按钮，在独立窗口中打开本页面，即可正常使用 USB 串口与蓝牙功能。</p>
       </div>
       <button class="btn btn-open-window" onclick="openInNewWindow()">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="18" height="18">
@@ -74,7 +74,7 @@
         </div>
       </div>
 
-      <!-- 连接控制（双端口） -->
+      <!-- 连接控制（单控制器） -->
       <div class="control-bar">
         <div class="control-left">
           <div class="baud-group">
@@ -93,41 +93,52 @@
         </div>
       </div>
 
-      <!-- 双端口连接区 -->
-      <div class="dual-port-bar">
+      <!-- 蓝牙设备筛选（减少无关设备出现在系统选择列表中） -->
+      <div class="control-bar ble-filter-bar" id="bleFilterBar">
+        <div class="control-left ble-filter-controls">
+          <div class="baud-group ble-filter-group">
+            <label for="bleFilterType">蓝牙筛选</label>
+            <select id="bleFilterType" title="多数 ESP 固件未在广播里声明 NUS，若「仅 NUS」一直为空请改选「全部附近设备」">
+              <option value="all" selected>全部附近设备（默认，易搜到）</option>
+              <option value="nus">仅 NUS 广播（列表少；未广播 UUID 则为空）</option>
+              <option value="namePrefixNoSvc">仅名称前缀（不限制服务，需填前缀）</option>
+              <option value="ybc">名称前缀 ybc / YBC + NUS</option>
+              <option value="namePrefix">名称前缀 + NUS 广播</option>
+              <option value="exactName">精确名称 + NUS 广播</option>
+            </select>
+          </div>
+          <input type="text" id="bleFilterValue" class="ble-filter-value-input" placeholder="输入前缀或完整设备名" autocomplete="off" spellcheck="false" disabled aria-label="蓝牙名称筛选">
+        </div>
+        <span class="ble-filter-hint" id="bleFilterHint">连接时仍会校验 GATT 是否包含 Nordic UART。若选「仅 NUS」出现「找不到兼容设备」，说明硬件未在广播里声明该服务，请改用「全部附近设备」或「仅名称前缀」。</span>
+        <span class="ble-filter-warn" id="bleSecureWarn" style="display:none;"></span>
+      </div>
+
+      <!-- 单控制器连接区 -->
+      <div class="controller-connection-bar">
         <div class="port-slot port-slot-1">
           <div class="port-slot-header">
-            <span class="port-label">🎮 手柄 1 (P1)</span>
+            <span class="port-label">🎮 控制器</span>
             <div class="port-status-row">
               <div class="status-dot" id="statusDot1"></div>
               <span class="status-text" id="statusText1">未连接</span>
             </div>
           </div>
           <span class="port-info" id="portInfo1"></span>
-          <button class="btn btn-connect btn-connect-sm" id="connectBtn1" onclick="toggleConnection('port1')">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="14" height="14">
-              <path d="M6 3v7a6 6 0 0 0 6 6 6 6 0 0 0 6-6V3"/>
-              <line x1="4" y1="21" x2="20" y2="21"/>
-            </svg>
-            <span>连接</span>
-          </button>
-        </div>
-        <div class="port-slot port-slot-2">
-          <div class="port-slot-header">
-            <span class="port-label">🎮 手柄 2 (P2)</span>
-            <div class="port-status-row">
-              <div class="status-dot" id="statusDot2"></div>
-              <span class="status-text" id="statusText2">未连接</span>
-            </div>
+          <div class="port-slot-actions">
+            <button class="btn btn-connect btn-connect-sm" id="connectBtn1" onclick="toggleConnection('port1')">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="14" height="14">
+                <path d="M6 3v7a6 6 0 0 0 6 6 6 6 0 0 0 6-6V3"/>
+                <line x1="4" y1="21" x2="20" y2="21"/>
+              </svg>
+              <span>连接</span>
+            </button>
+            <button class="btn btn-connect btn-connect-sm btn-ble" id="bleConnectBtn1" onclick="toggleBleConnection('port1')" title="Web Bluetooth (Nordic UART)">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="14" height="14">
+                <path d="M6.5 6.5l11 11M12 3v18M17.5 6.5l-11 11"/>
+              </svg>
+              <span>蓝牙</span>
+            </button>
           </div>
-          <span class="port-info" id="portInfo2"></span>
-          <button class="btn btn-connect btn-connect-sm" id="connectBtn2" onclick="toggleConnection('port2')">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="14" height="14">
-              <path d="M6 3v7a6 6 0 0 0 6 6 6 6 0 0 0 6-6V3"/>
-              <line x1="4" y1="21" x2="20" y2="21"/>
-            </svg>
-            <span>连接</span>
-          </button>
         </div>
       </div>
 
@@ -176,8 +187,8 @@
               <line x1="10" y1="18" x2="10" y2="22"/>
               <line x1="14" y1="18" x2="14" y2="22"/>
             </svg>
-            <p>点击「连接串口」按钮开始</p>
-            <p class="hint">请确保 ESP32 已通过 USB 连接到电脑</p>
+            <p>点击「连接」使用 USB 串口，或点击「蓝牙」使用 Web Bluetooth（Nordic UART）</p>
+            <p class="hint">USB：请确保 ESP32 已通过数据线连接；蓝牙：设备需支持 BLE Nordic UART 服务</p>
             <p class="hint" style="margin-top:6px; color:#febc2e;">提示：串口输出默认关闭，点击右上角 👁 按钮可开启数据查看</p>
             <div class="platform-hints">
               <div class="platform-hint">
@@ -202,9 +213,7 @@
         <input type="text" id="sendInput" placeholder="输入要发送的数据..." onkeydown="if(event.key==='Enter')sendData()" disabled>
         <div class="send-options">
           <select id="sendTarget" class="send-target-select" title="发送目标">
-            <option value="port1">→ P1</option>
-            <option value="port2">→ P2</option>
-            <option value="all">→ 全部</option>
+            <option value="port1">→ 控制器</option>
           </select>
           <label class="checkbox-label">
             <input type="checkbox" id="sendNewline" checked>
@@ -227,7 +236,15 @@
           <line x1="12" y1="8" x2="12" y2="12"/>
           <line x1="12" y1="16" x2="12.01" y2="16"/>
         </svg>
-        <span>当前浏览器不支持 Web Serial API，请使用 <strong>Chrome 89+</strong> 或 <strong>Edge 89+</strong></span>
+        <span>当前浏览器不支持 Web Serial API（USB 串口），请使用 <strong>Chrome 89+</strong> 或 <strong>Edge 89+</strong></span>
+      </div>
+      <div class="browser-notice browser-notice-ble" id="bluetoothNotice" style="display:none;">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="20" height="20">
+          <circle cx="12" cy="12" r="10"/>
+          <line x1="12" y1="8" x2="12" y2="12"/>
+          <line x1="12" y1="16" x2="12.01" y2="16"/>
+        </svg>
+        <span>当前浏览器不支持 Web Bluetooth，无线连接请使用 <strong>Chrome 或 Edge</strong>（桌面端）</span>
       </div>
     </div>
 
@@ -255,94 +272,39 @@
             </button>
             <!-- 游戏下拉菜单 -->
             <div class="game-menu" id="gameMenu">
-              <div class="game-menu-item" data-game="none" onclick="selectGame('none')">
-                <div class="game-menu-icon">
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" width="20" height="20">
-                    <rect x="2" y="3" width="20" height="14" rx="2"/>
-                    <line x1="8" y1="21" x2="16" y2="21"/>
-                    <line x1="12" y1="17" x2="12" y2="21"/>
-                  </svg>
-                </div>
-                <div class="game-menu-info">
-                  <span class="game-menu-name">无 (空白画面)</span>
-                  <span class="game-menu-desc">清空游戏区域</span>
-                </div>
-              </div>
               <div class="game-menu-item" data-game="pong" onclick="selectGame('pong')">
                 <div class="game-menu-icon">🏓</div>
                 <div class="game-menu-info">
                   <span class="game-menu-name">Pong 弹球</span>
-                  <span class="game-menu-desc">经典弹球游戏 · 可用串口手柄控制</span>
+                  <span class="game-menu-desc">摇晃控制器开始 · 转动电机控制左侧挡板</span>
                 </div>
               </div>
               <div class="game-menu-item" data-game="snake" onclick="selectGame('snake')">
                 <div class="game-menu-icon">🐍</div>
                 <div class="game-menu-info">
                   <span class="game-menu-name">贪吃蛇</span>
-                  <span class="game-menu-desc">经典贪吃蛇 · 方向键或串口控制</span>
+                  <span class="game-menu-desc">摇晃控制器开始 · 前后左右倾斜控制方向</span>
                 </div>
               </div>
               <div class="game-menu-item" data-game="dino" onclick="selectGame('dino')">
                 <div class="game-menu-icon">🦖</div>
                 <div class="game-menu-info">
                   <span class="game-menu-name">恐龙跳跃</span>
-                  <span class="game-menu-desc">Chrome 小恐龙 · 按空格或串口跳跃</span>
+                  <span class="game-menu-desc">摇晃控制器开始 · 转动电机跳跃</span>
                 </div>
               </div>
               <div class="game-menu-item" data-game="jump" onclick="selectGame('jump')">
                 <div class="game-menu-icon">🦘</div>
                 <div class="game-menu-info">
-                  <span class="game-menu-name">跳一跳</span>
-                  <span class="game-menu-desc">蓄力跳跃 · 精准落点拿高分</span>
+                  <span class="game-menu-name">数字测量尺</span>
+                  <span class="game-menu-desc">摇晃控制器开始 · 转动电机测距跳跃</span>
                 </div>
               </div>
               <div class="game-menu-item" data-game="fishing" onclick="selectGame('fishing')">
                 <div class="game-menu-icon">🎣</div>
                 <div class="game-menu-info">
                   <span class="game-menu-name">钓鱼达人</span>
-                  <span class="game-menu-desc">50种鱼类 · 图鉴收集 · 串口手柄控制</span>
-                </div>
-              </div>
-              <div class="game-menu-item" data-game="ruler" onclick="selectGame('ruler')">
-                <div class="game-menu-icon">📏</div>
-                <div class="game-menu-info">
-                  <span class="game-menu-name">数字测量尺</span>
-                  <span class="game-menu-desc">精准测量工具 · 即将上线</span>
-                </div>
-              </div>
-              <div class="game-menu-item" data-game="gomoku" onclick="selectGame('gomoku')">
-                <div class="game-menu-icon">⚫</div>
-                <div class="game-menu-info">
-                  <span class="game-menu-name">五子棋</span>
-                  <span class="game-menu-desc">人机对战 / 双人对战 · 串口手柄控制</span>
-                </div>
-              </div>
-              <div class="game-menu-item" data-game="tank" onclick="selectGame('tank')">
-                <div class="game-menu-icon">🔫</div>
-                <div class="game-menu-info">
-                  <span class="game-menu-name">90坦克大战</span>
-                  <span class="game-menu-desc">经典坦克大战 · 双人对战 · 串口手柄控制</span>
-                </div>
-              </div>
-              <div class="game-menu-item" data-game="pokemon" onclick="selectGame('pokemon')">
-                <div class="game-menu-icon">⚡</div>
-                <div class="game-menu-info">
-                  <span class="game-menu-name">宝可梦RPG</span>
-                  <span class="game-menu-desc">复古像素RPG · P2手柄探索 · 草丛冒险</span>
-                </div>
-              </div>
-              <div class="game-menu-item" data-game="runner" onclick="selectGame('runner')">
-                <div class="game-menu-icon">🏃</div>
-                <div class="game-menu-info">
-                  <span class="game-menu-name">3D 极速跑酷</span>
-                  <span class="game-menu-desc">3D跑酷 · 三跑道切换 · 虚拟摇杆控制</span>
-                </div>
-              </div>
-              <div class="game-menu-item" data-game="gyro" onclick="selectGame('gyro')">
-                <div class="game-menu-icon">🎯</div>
-                <div class="game-menu-info">
-                  <span class="game-menu-name">体感平衡球</span>
-                  <span class="game-menu-desc">陀螺仪体感控制 · 迷宫闯关 · 收集星星</span>
+                  <span class="game-menu-desc">摇晃控制器开始 / 继续 · 单电机卷线 · 最多 20 杆</span>
                 </div>
               </div>
             </div>

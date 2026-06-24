@@ -240,6 +240,63 @@ h1 {
   border-color: var(--accent);
 }
 
+/* 蓝牙筛选条（与 reference/index.js 一致：按服务/名称收窄 requestDevice） */
+.ble-filter-bar {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 6px;
+}
+
+.ble-filter-controls {
+  width: 100%;
+  align-items: flex-start;
+}
+
+.ble-filter-group select {
+  min-width: 11rem;
+}
+
+.ble-filter-value-input {
+  flex: 1;
+  min-width: 120px;
+  max-width: 100%;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  color: var(--text);
+  font-size: 0.75rem;
+  font-family: var(--font-mono);
+  padding: 5px 10px;
+  border-radius: 7px;
+  outline: none;
+  transition: border-color 0.2s, opacity 0.2s;
+}
+
+.ble-filter-value-input:focus {
+  border-color: var(--accent);
+}
+
+.ble-filter-value-input.is-disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.ble-filter-hint {
+  font-size: 0.65rem;
+  color: var(--text-dim);
+  line-height: 1.35;
+}
+
+.ble-filter-warn {
+  display: block;
+  font-size: 0.65rem;
+  color: #fbbf24;
+  line-height: 1.4;
+  padding: 6px 8px;
+  background: rgba(251, 191, 36, 0.08);
+  border-radius: 8px;
+  border: 1px solid rgba(251, 191, 36, 0.25);
+}
+
 .status-dot {
   width: 7px;
   height: 7px;
@@ -717,7 +774,7 @@ h1 {
 }
 
 .game-viewport {
-  width: 100%;
+  width: min(100%, max(320px, calc(150vh - 198px)));
   max-height: 100%;
   aspect-ratio: 3 / 2;
   background: #12141c;
@@ -728,7 +785,7 @@ h1 {
   align-items: center;
   justify-content: center;
   position: relative;
-  /* 保持在容器中居中且不超出 */
+  /* 以高度反推最大宽度，左侧面板收起后仍保持 3:2 并居中 */
   max-width: 100%;
 }
 
@@ -865,6 +922,10 @@ h1 {
   color: var(--text);
 }
 
+.browser-notice-ble {
+  margin-top: 8px;
+}
+
 /* ===== 游戏选择器 ===== */
 .game-selector-wrapper {
   position: relative;
@@ -994,11 +1055,9 @@ h1 {
   border-radius: 8px;
 }
 
-/* ===== 双端口连接区 ===== */
-.dual-port-bar {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 8px;
+/* ===== 单控制器连接区 ===== */
+.controller-connection-bar {
+  display: block;
 }
 
 .port-slot {
@@ -1041,6 +1100,19 @@ h1 {
   padding: 1px 4px;
 }
 
+.port-slot-actions {
+  display: flex;
+  gap: 6px;
+  width: 100%;
+  align-items: stretch;
+}
+
+.port-slot-actions .btn-connect-sm {
+  flex: 1;
+  width: auto;
+  min-width: 0;
+}
+
 .btn-connect-sm {
   padding: 5px 10px !important;
   font-size: 0.72rem !important;
@@ -1054,15 +1126,15 @@ h1 {
   height: 12px !important;
 }
 
+.btn-ble.connected {
+  border-color: rgba(96, 165, 250, 0.45);
+  box-shadow: 0 0 10px rgba(96, 165, 250, 0.2);
+}
+
 /* 端口连接时的视觉反馈 */
 .port-slot-1 .status-dot.connected {
   background: var(--game-accent);
   box-shadow: 0 0 8px rgba(34, 211, 238, 0.4);
-}
-
-.port-slot-2 .status-dot.connected {
-  background: #f472b6;
-  box-shadow: 0 0 8px rgba(244, 114, 182, 0.4);
 }
 
 /* 发送目标选择 */
@@ -1173,8 +1245,8 @@ h1 {
     flex-wrap: wrap;
   }
 
-  .dual-port-bar {
-    grid-template-columns: 1fr;
+  .controller-connection-bar {
+    display: block;
   }
 }
 
