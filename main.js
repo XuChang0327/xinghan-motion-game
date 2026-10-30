@@ -258,6 +258,7 @@ function rememberBleConnection(device) {
 async function attachSerialPort(portId, port, baudRate, options = {}) {
   const sp = serialPorts[portId];
   sp.port = port;
+  sp.baudRate = baudRate;
   await sp.port.open({ baudRate });
   sp.transport = 'serial';
   sp.isConnected = true;
@@ -426,13 +427,21 @@ async function readLoopForPort(portId) {
   sp.reader = decoder.readable.getReader();
 
   let buffer = '';
+  sp.lastDataAt = Date.now();
 
   try {
     while (true) {
       const { value, done } = await sp.reader.read();
       if (done) break;
 
-      buffer = processIncomingTextChunk(buffer, value, portId);
+      sp.lastDataAt = Date.now();
+      // 单条消息的解析异常绝不能终止读取循环：一旦退出读取，
+      // 硬件端 50Hz 的输出会塞满 USB 缓冲并阻塞其主循环（表现为硬件“卡死”）。
+      try {
+        buffer = processIncomingTextChunk(buffer, value, portId);
+      } catch (err) {
+        console.error(`Serial data handler error (${portId}):`, err);
+      }
     }
   } catch (err) {
     if (sp.transport === 'serial' && sp.isConnected) {
@@ -443,8 +452,86 @@ async function readLoopForPort(portId) {
       sp.reader.releaseLock();
       sp.reader = null;
     }
+    // 读循环退出且并非用户主动断开时，清理“假连接”状态并自愈；
+    // 否则界面仍显示已连接、游戏继续发指令，硬件端输出无人接收会被堵死。
+    if (sp.transport === 'serial' && sp.isConnected) {
+      await forceSerialRecovery(portId, 'read-loop-exited');
+    }
   }
 }
+
+/** 读循环意外退出 / 看门狗超时后的自愈：清理状态并尝试重开同一串口。
+ *  重新 open 会重建底层流，通常可解除固件 stdout 被阻塞的状态。 */
+async function forceSerialRecovery(portId, reason) {
+  const sp = serialPorts[portId];
+  if (sp.transport !== 'serial') return;
+  appendLine('error', `[${sp.label}] 连接异常（${reason}），正在尝试恢复…`, true);
+  sp.isConnected = false;
+  try {
+    if (sp.reader) {
+      try { await sp.reader.cancel(); } catch (_) {}
+      sp.reader = null;
+    }
+    if (sp.readableStreamClosed) {
+      await sp.readableStreamClosed.catch(() => {});
+      sp.readableStreamClosed = null;
+    }
+    if (sp.port) {
+      try { await sp.port.close(); } catch (_) {}
+      try {
+        const baudRate = sp.baudRate || parseInt(baudRateSelect.value, 10) || 115200;
+        await sp.port.open({ baudRate });
+        sp.transport = 'serial';
+        sp.isConnected = true;
+        updateGlobalConnected();
+        updatePortUI(portId, describeSerialPort(sp.port));
+        appendLine('system', `[${sp.label}] 已恢复 USB 连接`, true);
+        readLoopForPort(portId);
+        return;
+      } catch (err) {
+        console.error(`Serial recovery error (${portId}):`, err);
+      }
+    }
+  } catch (err) {
+    console.error(`Serial recovery error (${portId}):`, err);
+  }
+  sp.readableStreamClosed = null;
+  sp.port = null;
+  sp.transport = null;
+  sp.isConnected = false;
+  updateGlobalConnected();
+  updatePortUI(portId);
+  appendLine('error', `[${sp.label}] 自动恢复失败，请手动重新连接`, true);
+}
+
+// ===== 硬件数据流看门狗 =====
+// 硬件端正常以 50Hz 上报 ANGLE|；若已连接但连续数秒无任何数据，
+// 说明硬件端输出被阻塞（USB 缓冲塞满、电机总线挂起）或读取流僵死。
+// 先告警，再主动重置串口连接以解除阻塞。
+const SERIAL_STALL_WARN_MS = 3000;
+const SERIAL_STALL_RECOVER_MS = 6000;
+let _serialStallWarned = false;
+
+setInterval(() => {
+  const sp = serialPorts.port1;
+  if (!sp || sp.transport !== 'serial' || !sp.isConnected) {
+    _serialStallWarned = false;
+    return;
+  }
+  const silent = Date.now() - (sp.lastDataAt || 0);
+  if (silent < SERIAL_STALL_WARN_MS) {
+    _serialStallWarned = false;
+    return;
+  }
+  if (!_serialStallWarned) {
+    _serialStallWarned = true;
+    appendLine('error', `[${sp.label}] 已 ${Math.round(silent / 1000)} 秒未收到硬件数据，硬件端可能已阻塞`, true);
+  }
+  if (silent >= SERIAL_STALL_RECOVER_MS) {
+    sp.lastDataAt = Date.now(); // 防止恢复期间重复触发
+    forceSerialRecovery('port1', 'data-stall');
+  }
+}, 1000);
 
 /** USB 或 BLE 统一写出（供终端与游戏内指令） */
 async function writeToPort(portId, text) {
@@ -5724,7 +5811,7 @@ function startFishing() {
   const imgNames = [
     '开始界面', '钓鱼界面', '结算界面蒙层', '数据看板', '次数看板',
     '呆猫走路1', '呆猫走路2', '呆猫钓鱼姿势',
-    '开始钓鱼1', '开始钓鱼2', '继续钓鱼1', '继续钓鱼2', '查看数据1', '查看数据2',
+    '开始钓鱼1', '开始钓鱼2', '继续钓鱼1', '继续钓鱼2', '查看数据1', '查看数据2', '回到主页1', '回到主页2',
     '鱼饵', '鱼儿咬钩', '倒计时', '鱼数量', '鱼重量',
     ...FISHING_V2_FISH_TYPES,
   ];
@@ -5747,6 +5834,7 @@ function startFishing() {
   const state = {
     gameState: 'start',
     viewDataState: 'normal',
+    dashboardAt: 0,
     fishCount: 0,
     fishWeight: 0,
     castCount: 0,
@@ -5843,11 +5931,30 @@ function startFishing() {
     if (state.castCount >= maxCasts) {
       if (state.viewDataState === 'normal') {
         state.viewDataState = 'data_dashboard';
+        state.dashboardAt = performance.now() / 1000;
         fishingV2PlaySfx('按钮音效');
       }
       return;
     }
     beginContinueFishing();
+  }
+
+  function dashboardWaitDone() {
+    return state.dashboardAt > 0 && performance.now() / 1000 - state.dashboardAt >= 3;
+  }
+
+  function backToHomeFromDashboard() {
+    fishingV2PlaySfx('按钮音效');
+    state.gameState = 'start';
+    state.viewDataState = 'normal';
+    state.dashboardAt = 0;
+    state.castCount = 0;
+    state.fishCount = 0;
+    state.fishWeight = 0;
+    state.currentFishType = null;
+    resetBaitState();
+    state.catY = layout.startY;
+    fishingV2SendHardware('RESET');
   }
 
   function updateMotorFromRaw(rawDeg) {
@@ -5951,6 +6058,10 @@ function startFishing() {
     ctx.textAlign = 'center';
     ctx.fillText(`${state.fishWeight.toFixed(2)}kg`, layout.dashTotalKg.x, layout.dashTotalKg.y);
     ctx.fillText(`${avg.toFixed(2)}kg`, layout.dashAvgKg.x, layout.dashAvgKg.y);
+    if (dashboardWaitDone()) {
+      const hb = state.showFirstImage ? imgs['回到主页1'] : imgs['回到主页2'];
+      drawScaledCenter(hb, layout.startFishBtn.x, layout.startFishBtn.y, sy);
+    }
   }
 
   function drawFrame() {
@@ -6114,6 +6225,7 @@ function startFishing() {
         state.fishEscaped = false;
         state.gameState = 'result';
         state.viewDataState = 'data_dashboard';
+        state.dashboardAt = nowSec;
         state.currentFishType = null;
         fishingV2SendHardware('RESET');
       }
@@ -6126,6 +6238,8 @@ function startFishing() {
         beginFromStartScreen();
       } else if (state.gameState === 'result' && state.viewDataState === 'normal') {
         onResultGyroShakeFromParent();
+      } else if (state.gameState === 'result' && state.viewDataState === 'data_dashboard' && dashboardWaitDone()) {
+        backToHomeFromDashboard();
       }
     }
 
@@ -6158,6 +6272,8 @@ function startFishing() {
   window._fishingHandleButton = function (pressed, source) {
     if (source !== 'port1' || !pressed) return;
     if (state.gameState === 'result' && state.viewDataState === 'normal') {
+      state.gyroJump = true;
+    } else if (state.gameState === 'result' && state.viewDataState === 'data_dashboard' && dashboardWaitDone()) {
       state.gyroJump = true;
     }
   };
@@ -6193,18 +6309,11 @@ function startFishing() {
     if (k === 'a' || k === 'A' || k === 'ArrowLeft') state.keySimRot = -1;
     if (k === 'd' || k === 'D' || k === 'ArrowRight') state.keySimRot = 1;
     if (k === ' ' || k === 'Enter') {
-      state.gyroJump = true;
       if (state.gameState === 'result' && state.viewDataState === 'data_dashboard') {
-        state.gameState = 'start';
-        state.viewDataState = 'normal';
-        state.castCount = 0;
-        state.fishCount = 0;
-        state.fishWeight = 0;
-        state.currentFishType = null;
-        resetBaitState();
-        state.catY = layout.startY;
-        fishingV2SendHardware('RESET');
+        if (dashboardWaitDone()) backToHomeFromDashboard();
+        return;
       }
+      state.gyroJump = true;
     }
   }
   function onKeyUp(e) {
