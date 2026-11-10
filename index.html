@@ -19,8 +19,8 @@
       </div>
       <div class="iframe-notice-content">
         <h3>需要在新窗口中打开</h3>
-        <p>当前页面运行在嵌入式框架（iframe）中，浏览器安全策略禁止在此环境下访问串口与蓝牙设备。</p>
-        <p class="iframe-notice-hint">请点击下方按钮，在独立窗口中打开本页面，即可正常使用 USB 串口与蓝牙功能。</p>
+        <p>当前页面运行在嵌入式框架（iframe）中，浏览器安全策略禁止在此环境下访问串口设备。</p>
+        <p class="iframe-notice-hint">请点击下方按钮，在独立窗口中打开本页面，即可正常使用 USB 串口连接与脚本注入功能。</p>
       </div>
       <button class="btn btn-open-window" onclick="openInNewWindow()">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="18" height="18">
@@ -93,26 +93,6 @@
         </div>
       </div>
 
-      <!-- 蓝牙设备筛选（减少无关设备出现在系统选择列表中） -->
-      <div class="control-bar ble-filter-bar" id="bleFilterBar">
-        <div class="control-left ble-filter-controls">
-          <div class="baud-group ble-filter-group">
-            <label for="bleFilterType">蓝牙筛选</label>
-            <select id="bleFilterType" title="多数 ESP 固件未在广播里声明 NUS，若「仅 NUS」一直为空请改选「全部附近设备」">
-              <option value="all" selected>全部附近设备（默认，易搜到）</option>
-              <option value="nus">仅 NUS 广播（列表少；未广播 UUID 则为空）</option>
-              <option value="namePrefixNoSvc">仅名称前缀（不限制服务，需填前缀）</option>
-              <option value="ybc">名称前缀 ybc / YBC + NUS</option>
-              <option value="namePrefix">名称前缀 + NUS 广播</option>
-              <option value="exactName">精确名称 + NUS 广播</option>
-            </select>
-          </div>
-          <input type="text" id="bleFilterValue" class="ble-filter-value-input" placeholder="输入前缀或完整设备名" autocomplete="off" spellcheck="false" disabled aria-label="蓝牙名称筛选">
-        </div>
-        <span class="ble-filter-hint" id="bleFilterHint">连接时仍会校验 GATT 是否包含 Nordic UART。若选「仅 NUS」出现「找不到兼容设备」，说明硬件未在广播里声明该服务，请改用「全部附近设备」或「仅名称前缀」。</span>
-        <span class="ble-filter-warn" id="bleSecureWarn" style="display:none;"></span>
-      </div>
-
       <!-- 单控制器连接区 -->
       <div class="controller-connection-bar">
         <div class="port-slot port-slot-1">
@@ -132,13 +112,41 @@
               </svg>
               <span>连接</span>
             </button>
-            <button class="btn btn-connect btn-connect-sm btn-ble" id="bleConnectBtn1" onclick="toggleBleConnection('port1')" title="Web Bluetooth (Nordic UART)">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="14" height="14">
-                <path d="M6.5 6.5l11 11M12 3v18M17.5 6.5l-11 11"/>
-              </svg>
-              <span>蓝牙</span>
-            </button>
           </div>
+        </div>
+      </div>
+
+      <!-- 脚本注入（仅有线串口，方案见《硬件代码注入技术方案.md》） -->
+      <div class="upload-bar" id="uploadBar">
+        <div class="upload-controls">
+          <div class="baud-group">
+            <label for="containerSelect">目标容器</label>
+            <select id="containerSelect" title="把 钓鱼达人.py 注入设备上的选中容器目录，随后在设备端选择运行该程序">
+              <option value="container1" selected>container1</option>
+              <option value="container2">container2</option>
+              <option value="container3">container3</option>
+              <option value="container4">container4</option>
+              <option value="container5">container5</option>
+            </select>
+          </div>
+          <button class="btn btn-upload" id="uploadFirmwareBtn" onclick="uploadFirmwareToContainer()" title="将本站固件源码以 钓鱼达人.py 为名注入选中容器；完成后在设备端手动选择运行">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="14" height="14">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+              <polyline points="17 8 12 3 7 8"/>
+              <line x1="12" y1="3" x2="12" y2="15"/>
+            </svg>
+            <span>注入脚本</span>
+          </button>
+        </div>
+        <p class="upload-hint" id="uploadHint">选择容器 →「注入脚本」写入设备，然后在设备端手动选择运行该程序即可。</p>
+        <div class="upload-status" id="uploadStatus" style="display:none;">
+          <div class="upload-progress-track"><div class="upload-progress-fill" id="uploadProgressFill"></div></div>
+          <span class="upload-phase" id="uploadPhase"></span>
+          <button class="btn btn-upload btn-cancel" id="uploadCancelBtn" onclick="cancelFirmwareUpload()" style="display:none;"><span>取消</span></button>
+        </div>
+        <div class="upload-error" id="uploadError" style="display:none;">
+          <span class="upload-error-msg" id="uploadErrorMsg"></span>
+          <pre class="upload-error-detail" id="uploadErrorDetail"></pre>
         </div>
       </div>
 
@@ -187,8 +195,8 @@
               <line x1="10" y1="18" x2="10" y2="22"/>
               <line x1="14" y1="18" x2="14" y2="22"/>
             </svg>
-            <p>点击「连接」使用 USB 串口，或点击「蓝牙」使用 Web Bluetooth（Nordic UART）</p>
-            <p class="hint">USB：请确保 ESP32 已通过数据线连接；蓝牙：设备需支持 BLE Nordic UART 服务</p>
+            <p>点击「连接」使用 USB 串口连接 ESP32 控制器</p>
+            <p class="hint">USB：请确保 ESP32 已通过数据线连接（本项目仅支持有线连接）</p>
             <p class="hint" style="margin-top:6px; color:#febc2e;">提示：串口输出默认关闭，点击右上角 👁 按钮可开启数据查看</p>
             <div class="platform-hints">
               <div class="platform-hint">
@@ -237,14 +245,6 @@
           <line x1="12" y1="16" x2="12.01" y2="16"/>
         </svg>
         <span>当前浏览器不支持 Web Serial API（USB 串口），请使用 <strong>Chrome 89+</strong> 或 <strong>Edge 89+</strong></span>
-      </div>
-      <div class="browser-notice browser-notice-ble" id="bluetoothNotice" style="display:none;">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="20" height="20">
-          <circle cx="12" cy="12" r="10"/>
-          <line x1="12" y1="8" x2="12" y2="12"/>
-          <line x1="12" y1="16" x2="12.01" y2="16"/>
-        </svg>
-        <span>当前浏览器不支持 Web Bluetooth，无线连接请使用 <strong>Chrome 或 Edge</strong>（桌面端）</span>
       </div>
     </div>
 
@@ -359,6 +359,8 @@
 
   <script type="module" src="./src/hmr-bridge.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.min.js"></script>
+  <script src="./firmware.js"></script>
+  <script src="./upload.js"></script>
   <script src="./main.js"></script>
 </body>
 </html>

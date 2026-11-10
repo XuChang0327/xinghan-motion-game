@@ -4,7 +4,8 @@
   "version": "0.0.0",
   "scripts": {
     "dev": "NODE_ENV=development vite --host --port 8000",
-    "publish": "node scripts/publish.js"
+    "build-firmware": "node scripts/build-firmware.js",
+    "publish": "node scripts/build-firmware.js && node scripts/publish.js"
   },
   "devDependencies": {
     "vite": "^5.4.2"

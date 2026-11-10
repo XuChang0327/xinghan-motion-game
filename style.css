@@ -240,61 +240,122 @@ h1 {
   border-color: var(--accent);
 }
 
-/* 蓝牙筛选条（与 reference/index.js 一致：按服务/名称收窄 requestDevice） */
-.ble-filter-bar {
-  flex-direction: column;
-  align-items: stretch;
-  gap: 6px;
-}
-
-.ble-filter-controls {
-  width: 100%;
-  align-items: flex-start;
-}
-
-.ble-filter-group select {
-  min-width: 11rem;
-}
-
-.ble-filter-value-input {
-  flex: 1;
-  min-width: 120px;
-  max-width: 100%;
-  background: var(--surface-2);
+/* ===== 脚本注入条（仅有线串口，方案见《硬件代码注入技术方案.md》） ===== */
+.upload-bar {
+  background: var(--surface);
   border: 1px solid var(--border);
-  color: var(--text);
-  font-size: 0.75rem;
-  font-family: var(--font-mono);
-  padding: 5px 10px;
-  border-radius: 7px;
-  outline: none;
-  transition: border-color 0.2s, opacity 0.2s;
+  border-radius: 10px;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  transition: border-color 0.2s;
 }
 
-.ble-filter-value-input:focus {
-  border-color: var(--accent);
+.upload-bar:hover {
+  border-color: var(--border-hover);
 }
 
-.ble-filter-value-input.is-disabled {
+.upload-controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.btn-upload {
+  background: rgba(52, 211, 153, 0.1);
+  color: #34d399;
+  border: 1px solid rgba(52, 211, 153, 0.35);
+  padding: 7px 14px;
+}
+
+.btn-upload:hover:not(:disabled) {
+  background: rgba(52, 211, 153, 0.18);
+  border-color: rgba(52, 211, 153, 0.6);
+}
+
+.btn-upload:disabled {
   opacity: 0.45;
   cursor: not-allowed;
 }
 
-.ble-filter-hint {
+.upload-hint {
+  margin: 0;
   font-size: 0.65rem;
   color: var(--text-dim);
-  line-height: 1.35;
+  line-height: 1.4;
 }
 
-.ble-filter-warn {
-  display: block;
-  font-size: 0.65rem;
-  color: #fbbf24;
-  line-height: 1.4;
-  padding: 6px 8px;
-  background: rgba(251, 191, 36, 0.08);
+.upload-status {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.upload-progress-track {
+  flex: 1;
+  min-width: 120px;
+  height: 6px;
+  background: var(--surface-2);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.upload-progress-fill {
+  height: 100%;
+  width: 0%;
+  background: linear-gradient(90deg, #34d399, var(--accent));
+  border-radius: 3px;
+  transition: width 0.25s ease;
+}
+
+.upload-phase {
+  font-size: 0.7rem;
+  font-family: var(--font-mono);
+  color: var(--text);
+  white-space: nowrap;
+}
+
+.btn-cancel {
+  padding: 4px 10px;
+  font-size: 0.7rem;
+  background: rgba(248, 113, 113, 0.08);
+  color: #f87171;
+  border: 1px solid rgba(248, 113, 113, 0.4);
+}
+
+.btn-cancel:hover:not(:disabled) {
+  background: rgba(248, 113, 113, 0.16);
+}
+
+.upload-error {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 10px;
+  background: rgba(248, 113, 113, 0.06);
+  border: 1px solid rgba(248, 113, 113, 0.3);
   border-radius: 8px;
-  border: 1px solid rgba(251, 191, 36, 0.25);
+}
+
+.upload-error-msg {
+  font-size: 0.72rem;
+  color: #f87171;
+  line-height: 1.45;
+}
+
+/* 失败时展示设备侧 traceback / 原始字节（§8.3-5 可诊断性） */
+.upload-error-detail {
+  margin: 0;
+  max-height: 160px;
+  overflow: auto;
+  font-size: 0.65rem;
+  font-family: var(--font-mono);
+  color: var(--text-dim);
+  white-space: pre-wrap;
+  word-break: break-all;
+  line-height: 1.45;
 }
 
 .status-dot {
@@ -922,10 +983,6 @@ h1 {
   color: var(--text);
 }
 
-.browser-notice-ble {
-  margin-top: 8px;
-}
-
 /* ===== 游戏选择器 ===== */
 .game-selector-wrapper {
   position: relative;
@@ -1124,11 +1181,6 @@ h1 {
 .btn-connect-sm svg {
   width: 12px !important;
   height: 12px !important;
-}
-
-.btn-ble.connected {
-  border-color: rgba(96, 165, 250, 0.45);
-  box-shadow: 0 0 10px rgba(96, 165, 250, 0.2);
 }
 
 /* 端口连接时的视觉反馈 */

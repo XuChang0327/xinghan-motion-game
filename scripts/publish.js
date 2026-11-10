@@ -35,7 +35,20 @@ console.log('✅ 目标目录准备完成\n');
 console.log('📋 步骤 2/2: 复制项目文件...');
 
 // 需要复制的文件和目录列表
-const itemsToCopy = ['index.html', 'style.css', 'src'];
+// main.js / upload.js / firmware.js / assets：页面运行必需（index.html 直接引用）
+// firmware.js 内嵌脚本源码（由 build-firmware.js 生成，publish 前自动重建）；
+// .py 源文件一并拷贝，便于直接查看/下载，但注入引擎不依赖它们（部分平台代理拒发 .py → 403）
+const itemsToCopy = [
+  'index.html',
+  'style.css',
+  'main.js',
+  'upload.js',
+  'firmware.js',
+  'src',
+  'assets',
+  'hardware_main.py',
+  'device_main.py',
+];
 
 let copiedCount = 0;
 const errors = [];

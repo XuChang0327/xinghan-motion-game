@@ -1,13 +1,8 @@
-// ===== ESP32 Serial Monitor (Single Controller Support) =====
-
-// Nordic UART Service（与常见 ESP32 BLE 固件一致，可按需改 UUID）
-const NUS_SERVICE_UUID = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
-const NUS_RX_CHAR_UUID = '6e400002-b5a3-f393-e0a9-e50e24dcca9e'; // Central 写入 → 设备接收
-const NUS_TX_CHAR_UUID = '6e400003-b5a3-f393-e0a9-e50e24dcca9e'; // 设备 Notify → 浏览器接收
+// ===== ESP32 Serial Monitor (Single Controller, USB 有线串口) =====
 
 const HARDWARE_RESTORE_KEY = 'xhan-hardware-last-connection';
 
-// 单控制器连接状态：同一控制器可选择 USB 串口或 BLE 二选一连接。
+// 单控制器连接状态：仅支持 USB 有线串口（蓝牙方案已移除，见《硬件代码注入技术方案.md》）。
 const serialPorts = {
   port1: {
     port: null,
@@ -15,21 +10,19 @@ const serialPorts = {
     writer: null,
     isConnected: false,
     readableStreamClosed: null,
+    readLoopDone: null,
     label: '控制器',
     transport: null,
-    bluetoothDevice: null,
-    gattServer: null,
-    nusRxChar: null,
-    nusTxChar: null,
-    bleNotifyHandler: null,
-    bleLineBuffer: '',
-    bleTextDecoder: null,
-    gattDisconnectHandler: null,
   },
 };
 
 // 向后兼容：保留全局 isConnected（控制器连接即为 true）
 let isConnected = false;
+
+// 脚本注入会话状态：注入期间看门狗/自愈/指令发送全部挂起（§5.10 端口互斥）
+let _uploadInProgress = false;
+let _uploadAbortController = null;
+let _serialRecoveryInProgress = false; // 串口自愈进行中：并发自愈与注入启动都拒绝，防竞争同一端口
 
 // ===== 串口调试缓冲区（全局可见） =====
 window._serialDebug = {
@@ -52,7 +45,6 @@ let lineCount = 0;
 // DOM Elements
 const terminal = document.getElementById('terminal');
 const connectBtn1 = document.getElementById('connectBtn1');
-const bleConnectBtn1 = document.getElementById('bleConnectBtn1');
 const statusDot1 = document.getElementById('statusDot1');
 const statusText1 = document.getElementById('statusText1');
 const portInfo1El = document.getElementById('portInfo1');
@@ -62,111 +54,29 @@ const sendInput = document.getElementById('sendInput');
 const sendBtn = document.getElementById('sendBtn');
 const baudRateSelect = document.getElementById('baudRate');
 const browserNotice = document.getElementById('browserNotice');
-const bluetoothNotice = document.getElementById('bluetoothNotice');
 const iframeNotice = document.getElementById('iframeNotice');
 const sendTargetSelect = document.getElementById('sendTarget');
-const bleFilterBar = document.getElementById('bleFilterBar');
-const bleFilterType = document.getElementById('bleFilterType');
-const bleFilterValue = document.getElementById('bleFilterValue');
-
-/**
- * 构造 requestDevice 参数。
- * 注意：很多 ESP 固件不会在 BLE 广播里声明 NUS UUID，此时 filters.services 会在扫描阶段 0 个设备，需用 acceptAllDevices 或仅 namePrefix。
- * 连接成功后仍会 getPrimaryService(NUS) 校验协议。
- */
-function buildBleRequestDeviceOptions() {
-  const optionalServices = [NUS_SERVICE_UUID];
-  const type = (bleFilterType && bleFilterType.value) || 'all';
-  const raw = (bleFilterValue && bleFilterValue.value) ? bleFilterValue.value.trim() : '';
-
-  if (type === 'all') {
-    return { acceptAllDevices: true, optionalServices };
-  }
-  if (type === 'nus') {
-    return { filters: [{ services: [NUS_SERVICE_UUID] }], optionalServices };
-  }
-  if (type === 'namePrefixNoSvc') {
-    if (!raw) return null;
-    return { filters: [{ namePrefix: raw }], optionalServices };
-  }
-  if (type === 'ybc') {
-    return {
-      filters: [
-        { services: [NUS_SERVICE_UUID], namePrefix: 'ybc' },
-        { services: [NUS_SERVICE_UUID], namePrefix: 'YBC' },
-      ],
-      optionalServices,
-    };
-  }
-  if (type === 'namePrefix') {
-    if (!raw) {
-      return { filters: [{ services: [NUS_SERVICE_UUID] }], optionalServices };
-    }
-    return { filters: [{ services: [NUS_SERVICE_UUID], namePrefix: raw }], optionalServices };
-  }
-  if (type === 'exactName') {
-    if (!raw) return null;
-    return { filters: [{ services: [NUS_SERVICE_UUID], name: raw }], optionalServices };
-  }
-  return { acceptAllDevices: true, optionalServices };
-}
-
-function syncBleFilterInputs() {
-  if (!bleFilterType || !bleFilterValue) return;
-  const t = bleFilterType.value;
-  const need = t === 'namePrefix' || t === 'exactName' || t === 'namePrefixNoSvc';
-  bleFilterValue.disabled = !need;
-  bleFilterValue.classList.toggle('is-disabled', !need);
-  if (t === 'exactName') {
-    bleFilterValue.placeholder = '完整蓝牙显示名称';
-  } else if (t === 'namePrefix' || t === 'namePrefixNoSvc') {
-    bleFilterValue.placeholder = t === 'namePrefixNoSvc' ? '设备名前缀，如 ESP、UART' : '名称前缀 + 须广播 NUS';
-  } else {
-    bleFilterValue.placeholder = '输入前缀或完整设备名';
-  }
-}
-
-function initBleFilterControls() {
-  if (!bleFilterType || !bleFilterValue) return;
-  const bleSecureWarn = document.getElementById('bleSecureWarn');
-  if (bleSecureWarn && window.location.protocol === 'file:') {
-    bleSecureWarn.style.display = 'block';
-    bleSecureWarn.textContent =
-      '检测到 file:// 打开：建议运行 pnpm dev，用 http://localhost 访问，蓝牙/串口在本地页面更稳定。';
-  }
-  try {
-    const st = localStorage.getItem('ble-filter-type');
-    const sv = localStorage.getItem('ble-filter-value');
-    if (st) bleFilterType.value = st;
-    if (sv !== null) bleFilterValue.value = sv;
-  } catch (e) { /* ignore */ }
-  syncBleFilterInputs();
-  bleFilterType.addEventListener('change', () => {
-    syncBleFilterInputs();
-    try {
-      localStorage.setItem('ble-filter-type', bleFilterType.value);
-    } catch (e) { /* ignore */ }
-  });
-  bleFilterValue.addEventListener('input', () => {
-    try {
-      localStorage.setItem('ble-filter-value', bleFilterValue.value);
-    } catch (e) { /* ignore */ }
-  });
-}
+const containerSelect = document.getElementById('containerSelect');
+const uploadFirmwareBtn = document.getElementById('uploadFirmwareBtn');
+const uploadStatusEl = document.getElementById('uploadStatus');
+const uploadPhaseEl = document.getElementById('uploadPhase');
+const uploadProgressFill = document.getElementById('uploadProgressFill');
+const uploadCancelBtn = document.getElementById('uploadCancelBtn');
+const uploadErrorEl = document.getElementById('uploadError');
+const uploadErrorMsg = document.getElementById('uploadErrorMsg');
+const uploadErrorDetail = document.getElementById('uploadErrorDetail');
+const uploadHintEl = document.getElementById('uploadHint');
 
 // ===== 环境检测 =====
 const isInIframe = window.self !== window.top;
 
 function checkEnvironment() {
   const serialOk = 'serial' in navigator;
-  const bleOk = 'bluetooth' in navigator;
 
   // 检查是否在 iframe 中
   if (isInIframe) {
     iframeNotice.style.display = 'flex';
     if (connectBtn1) connectBtn1.disabled = true;
-    if (bleConnectBtn1) bleConnectBtn1.disabled = true;
-    if (bleFilterBar) bleFilterBar.style.display = 'none';
     sendInput.disabled = true;
     sendBtn.disabled = true;
     return false;
@@ -175,16 +85,10 @@ function checkEnvironment() {
   if (!serialOk) {
     browserNotice.style.display = 'flex';
     if (connectBtn1) connectBtn1.disabled = true;
-  }
-  if (!bleOk) {
-    if (bluetoothNotice) bluetoothNotice.style.display = 'flex';
-    if (bleConnectBtn1) bleConnectBtn1.disabled = true;
-    if (bleFilterBar) bleFilterBar.style.display = 'none';
-  } else if (bleFilterBar) {
-    bleFilterBar.style.display = '';
+    if (uploadFirmwareBtn) uploadFirmwareBtn.disabled = true;
   }
 
-  return serialOk || bleOk;
+  return serialOk;
 }
 
 // 在新窗口中打开当前页面
@@ -196,7 +100,6 @@ function openInNewWindow() {
 
 // 执行环境检测
 const envReady = checkEnvironment();
-initBleFilterControls();
 restoreHardwareConnection();
 
 // ===== 连接/断开（单控制器支持） =====
@@ -247,19 +150,14 @@ function rememberSerialConnection(baudRate) {
   });
 }
 
-function rememberBleConnection(device) {
-  rememberHardwareConnection({
-    transport: 'ble',
-    deviceId: device && device.id ? device.id : '',
-    deviceName: device && device.name ? device.name : '',
-  });
-}
-
 async function attachSerialPort(portId, port, baudRate, options = {}) {
   const sp = serialPorts[portId];
   sp.port = port;
   sp.baudRate = baudRate;
-  await sp.port.open({ baudRate });
+  // alreadyOpen：脚本注入结束后复用注入会话打开的端口，跳过重复 open
+  if (!options.alreadyOpen) {
+    await sp.port.open({ baudRate });
+  }
   sp.transport = 'serial';
   sp.isConnected = true;
 
@@ -271,7 +169,7 @@ async function attachSerialPort(portId, port, baudRate, options = {}) {
     appendLine('system', getPlatformHint(), true);
   }
   rememberSerialConnection(baudRate);
-  readLoopForPort(portId);
+  sp.readLoopDone = readLoopForPort(portId);
 }
 
 async function restoreSerialConnection(portId, saved) {
@@ -285,28 +183,19 @@ async function restoreSerialConnection(portId, saved) {
   return true;
 }
 
-async function restoreBleConnection(portId, saved) {
-  if (!('bluetooth' in navigator) || typeof navigator.bluetooth.getDevices !== 'function') return false;
-  const devices = await navigator.bluetooth.getDevices();
-  if (!devices.length) return false;
-
-  const device = devices.find(item => saved && saved.deviceId && item.id === saved.deviceId) || devices[0];
-  await attachBleDevice(portId, device, { restored: true });
-  appendLine('system', `[${serialPorts[portId].label}] 已自动恢复蓝牙连接`, true);
-  return true;
-}
-
 async function restoreHardwareConnection() {
   if (!envReady) return;
   const saved = getRememberedHardwareConnection();
   if (!saved || serialPorts.port1.isConnected) return;
 
+  // 蓝牙方案已移除：清掉历史遗留的 ble 记录
+  if (saved.transport !== 'serial') {
+    clearRememberedHardwareConnection();
+    return;
+  }
+
   try {
-    if (saved.transport === 'serial') {
-      await restoreSerialConnection('port1', saved);
-    } else if (saved.transport === 'ble') {
-      await restoreBleConnection('port1', saved);
-    }
+    await restoreSerialConnection('port1', saved);
   } catch (err) {
     console.warn('Hardware restore failed:', err);
     appendLine('system', '上次硬件连接未能自动恢复，请手动连接一次。', true);
@@ -324,11 +213,11 @@ async function toggleConnection(portId) {
 
 async function connectPort(portId) {
   const sp = serialPorts[portId];
+  if (_uploadInProgress) {
+    appendLine('error', '脚本注入进行中，请先等待完成或取消', true);
+    return;
+  }
   try {
-    if (sp.isConnected && sp.transport === 'ble') {
-      await disconnectBle(portId, true);
-    }
-
     const port = await navigator.serial.requestPort();
     const baudRate = parseInt(baudRateSelect.value, 10);
     await attachSerialPort(portId, port, baudRate);
@@ -340,6 +229,10 @@ async function connectPort(portId) {
 }
 
 async function disconnectPort(portId, silentLog) {
+  if (_uploadInProgress) {
+    appendLine('error', '脚本注入进行中，无法断开连接', true);
+    return;
+  }
   const sp = serialPorts[portId];
   if (sp.transport !== 'serial') return;
   try {
@@ -377,7 +270,7 @@ async function disconnectPort(portId, silentLog) {
 }
 
 function normalizeIncomingTextLine(line) {
-  // BLE NUS 有些固件会在文本包尾部带 NUL 或其它不可见控制字符。
+  // 有些固件会在文本行尾部带 NUL 或其它不可见控制字符。
   return String(line || '').replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, '').trim();
 }
 
@@ -400,21 +293,13 @@ function dispatchIncomingLine(line, portId) {
   }
 }
 
-/** 将文本块按行拆分并交给 handleSerialData / 终端（与 USB 读流、BLE notify 共用） */
-function processIncomingTextChunk(buffer, chunk, portId, options = {}) {
-  const chunkHasLineBreak = /\r|\n/.test(chunk);
+/** 将文本块按行拆分并交给 handleSerialData / 终端（USB 读流） */
+function processIncomingTextChunk(buffer, chunk, portId) {
   buffer += chunk;
   const lines = buffer.split(/\r?\n|\r/);
   buffer = lines.pop() || '';
   for (const line of lines) {
     dispatchIncomingLine(line, portId);
-  }
-
-  // 一些 BLE NUS 固件每个 notify 就是一条协议消息，不额外附带 \n。
-  // USB 串口仍保留按行解析，避免半包数据被提前消费。
-  if (options.flushChunkWithoutLineBreak && !chunkHasLineBreak && lines.length === 1 && buffer.trim()) {
-    dispatchIncomingLine(buffer, portId);
-    buffer = '';
   }
   return buffer;
 }
@@ -449,20 +334,35 @@ async function readLoopForPort(portId) {
     }
   } finally {
     if (sp.reader) {
-      sp.reader.releaseLock();
+      try { sp.reader.releaseLock(); } catch (_) {}
       sp.reader = null;
     }
     // 读循环退出且并非用户主动断开时，清理“假连接”状态并自愈；
     // 否则界面仍显示已连接、游戏继续发指令，硬件端输出无人接收会被堵死。
-    if (sp.transport === 'serial' && sp.isConnected) {
+    // 脚本注入期间读循环是被主动挂起的，跳过自愈（§5.10 端口互斥）。
+    if (sp.transport === 'serial' && sp.isConnected && !_uploadInProgress) {
       await forceSerialRecovery(portId, 'read-loop-exited');
     }
   }
 }
 
 /** 读循环意外退出 / 看门狗超时后的自愈：清理状态并尝试重开同一串口。
- *  重新 open 会重建底层流，通常可解除固件 stdout 被阻塞的状态。 */
+ *  重新 open 会重建底层流，通常可解除固件 stdout 被阻塞的状态。
+ *  互斥（§5.10）：注入进行中跳过自愈；自愈进行中拒绝并发自愈，
+ *  且 runFirmwareInjection 会拒绝启动——防止自愈 reopen 与注入
+ *  requestPort/open 竞争同一 SerialPort（审计 1b 竞态）。 */
 async function forceSerialRecovery(portId, reason) {
+  if (_uploadInProgress) return;
+  if (_serialRecoveryInProgress) return;
+  _serialRecoveryInProgress = true;
+  try {
+    await recoverSerialPort(portId, reason);
+  } finally {
+    _serialRecoveryInProgress = false;
+  }
+}
+
+async function recoverSerialPort(portId, reason) {
   const sp = serialPorts[portId];
   if (sp.transport !== 'serial') return;
   appendLine('error', `[${sp.label}] 连接异常（${reason}），正在尝试恢复…`, true);
@@ -486,7 +386,7 @@ async function forceSerialRecovery(portId, reason) {
         updateGlobalConnected();
         updatePortUI(portId, describeSerialPort(sp.port));
         appendLine('system', `[${sp.label}] 已恢复 USB 连接`, true);
-        readLoopForPort(portId);
+        sp.readLoopDone = readLoopForPort(portId);
         return;
       } catch (err) {
         console.error(`Serial recovery error (${portId}):`, err);
@@ -514,6 +414,11 @@ let _serialStallWarned = false;
 
 setInterval(() => {
   const sp = serialPorts.port1;
+  if (_uploadInProgress) {
+    // 注入会话期间设备被注入流程占用，看门狗整体暂停，避免误判静默
+    _serialStallWarned = false;
+    return;
+  }
   if (!sp || sp.transport !== 'serial' || !sp.isConnected) {
     _serialStallWarned = false;
     return;
@@ -533,186 +438,239 @@ setInterval(() => {
   }
 }, 1000);
 
-/** USB 或 BLE 统一写出（供终端与游戏内指令） */
+/** USB 串口统一写出（供终端与游戏内指令）；注入会话期间暂停 */
 async function writeToPort(portId, text) {
   const sp = serialPorts[portId];
   if (!sp.isConnected) throw new Error('未连接');
+  if (_uploadInProgress) throw new Error('脚本注入进行中，暂停发送指令');
   const encoder = new TextEncoder();
   const data = encoder.encode(text);
-  if (sp.transport === 'serial') {
-    if (!sp.port || !sp.port.writable) throw new Error('串口不可写');
-    const writable = sp.port.writable.getWriter();
-    await writable.write(data);
-    writable.releaseLock();
-  } else if (sp.transport === 'ble') {
-    if (!sp.nusRxChar) throw new Error('蓝牙特征未就绪');
-    await sp.nusRxChar.writeValue(data);
-  } else {
-    throw new Error('未知传输方式');
+  if (!sp.port || !sp.port.writable) throw new Error('串口不可写');
+  const writable = sp.port.writable.getWriter();
+  await writable.write(data);
+  writable.releaseLock();
+}
+
+// ===== 脚本注入（网页 → 设备容器，仅有线串口） =====
+// 协议实现见 upload.js（window.FirmwareUploader），本节负责三件事：
+// 1. 端口互斥：挂起游戏读循环 / 看门狗 / 指令发送（§5.10）
+// 2. UI 状态：进度、取消、错误详情上屏（§6）
+// 3. 结束后恢复游戏读循环，或把自行打开的端口挂成游戏端口
+
+// phase → [文案, 进度百分比]。进度只由协议事件驱动（§5.9），不由发送循环自增
+const UPLOAD_PHASE_UI = {
+  FETCH: ['读取脚本源码', 5],
+  HALTING: ['打断设备当前程序', 10],
+  PROBING: ['探测 raw paste 支持', 15],
+  PROBED: ['设备就绪', 20],
+  TRANSFERRING: ['传输脚本', 20], // 20→75 按 sent/total 缩放
+  COMMITTING: ['设备写盘中', 80],
+  VERIFYING: ['CRC 校验', 85],
+  RETRYING: ['校验失败，重试中', 30],
+  REBOOTING: ['复位设备，等待启动', 90],
+  DONE: ['完成', 100],
+};
+
+function setUploadUIState(running) {
+  if (uploadFirmwareBtn) uploadFirmwareBtn.disabled = running || !envReady;
+  if (containerSelect) containerSelect.disabled = running;
+  if (connectBtn1) connectBtn1.disabled = running || !envReady;
+  if (uploadCancelBtn) uploadCancelBtn.style.display = running ? '' : 'none';
+  if (uploadStatusEl) uploadStatusEl.style.display = running ? '' : 'none';
+  if (!running && uploadProgressFill) uploadProgressFill.style.width = '0%';
+}
+
+function renderUploadEvent(e) {
+  const ui = UPLOAD_PHASE_UI[e.phase];
+  if (!ui) return;
+  let pct = ui[1];
+  let text = ui[0];
+  if (e.phase === 'TRANSFERRING' && e.total) {
+    pct = 20 + Math.round((e.sent / e.total) * 55);
+    text = `传输脚本 ${Math.round((e.sent / e.total) * 100)}%`;
+  } else if (e.detail) {
+    text = `${ui[0]} — ${e.detail}`;
+  }
+  if (uploadPhaseEl) uploadPhaseEl.textContent = text;
+  if (uploadProgressFill) uploadProgressFill.style.width = pct + '%';
+}
+
+function showUploadError(result) {
+  if (!uploadErrorEl) return;
+  uploadErrorEl.style.display = '';
+  if (uploadErrorMsg) {
+    uploadErrorMsg.textContent = `[${result.code}] ${result.message}`
+      + (result.suggestion ? ` — ${result.suggestion}` : '');
+  }
+  if (uploadErrorDetail) {
+    // 可诊断性验收口径（§8.3-5）：任何失败都展示设备侧原始尾部字节
+    const parts = [];
+    if (result.deviceError) parts.push(result.deviceError);
+    if (result.rawTail) parts.push('— 设备原始字节（最近 512B）—\n' + result.rawTail);
+    uploadErrorDetail.textContent = parts.join('\n\n');
+    uploadErrorDetail.style.display = parts.length ? '' : 'none';
   }
 }
 
-async function connectBlePort(portId) {
+function hideUploadError() {
+  if (uploadErrorEl) uploadErrorEl.style.display = 'none';
+}
+
+/** 挂起游戏读循环，把端口让给注入会话（§5.10 端口互斥，事件驱动而非固定 sleep） */
+async function suspendSerialForUpload(portId) {
   const sp = serialPorts[portId];
-  if (!('bluetooth' in navigator)) {
-    appendLine('error', '当前浏览器不支持 Web Bluetooth', true);
+  if (sp.transport !== 'serial' || !sp.port) return;
+  if (sp.reader) {
+    try { await sp.reader.cancel(); } catch (_) {}
+  }
+  if (sp.readableStreamClosed) {
+    await sp.readableStreamClosed.catch(() => {});
+    sp.readableStreamClosed = null;
+  }
+  // 等读循环彻底退出（其 finally 因 _uploadInProgress 会跳过自愈）
+  if (sp.readLoopDone) {
+    try { await sp.readLoopDone; } catch (_) {}
+    sp.readLoopDone = null;
+  }
+  sp.reader = null;
+}
+
+/** 注入结束：重挂游戏读循环并恢复看门狗基准 */
+function resumeSerialAfterUpload(portId) {
+  const sp = serialPorts[portId];
+  _serialStallWarned = false;
+  if (sp.transport === 'serial' && sp.isConnected && sp.port) {
+    sp.lastDataAt = Date.now();
+    sp.readLoopDone = readLoopForPort(portId);
+  }
+}
+
+// sourceFile: 网页端源文件名（firmware.js 内嵌的键，如 'hardware_main.py'）
+// deviceFilename: 设备端落盘文件名（默认与 sourceFile 同名；可不同，如中文名 '钓鱼达人.py'）
+async function runFirmwareInjection(target, sourceFile, okMessage, deviceFilename) {
+  if (_uploadInProgress) return;
+  if (_serialRecoveryInProgress) {
+    showUploadError({ code: 'RecoveryInProgress', message: '串口自动恢复进行中，请稍候再注入', suggestion: '等终端出现「已恢复 USB 连接」或恢复失败提示后重试' });
     return;
   }
-  try {
-    if (sp.isConnected && sp.transport === 'serial') {
-      await disconnectPort(portId, true);
-    }
-
-    const requestOpts = buildBleRequestDeviceOptions();
-    if (!requestOpts) {
-      const t = bleFilterType && bleFilterType.value;
-      let hint = '请检查蓝牙筛选条件。';
-      if (t === 'exactName') hint = '选择「精确名称 + NUS」时请在右侧填写完整蓝牙名称。';
-      else if (t === 'namePrefixNoSvc') hint = '选择「仅名称前缀」时请在右侧填写名称前缀以缩小列表。';
-      appendLine('error', hint, true);
-      return;
-    }
-    const device = await navigator.bluetooth.requestDevice(requestOpts);
-
-    await attachBleDevice(portId, device);
-  } catch (err) {
-    if (err.name === 'NotFoundError') return;
-    appendLine('error', `[${sp.label}] 蓝牙连接失败: ${err.message}`, true);
-    console.error(`BLE connect error (${portId}):`, err);
-    await cleanupFailedBleConnection(portId);
+  if (!('serial' in navigator)) {
+    showUploadError({ code: 'BrowserUnsupported', message: '当前浏览器不支持 Web Serial，请使用 Chrome / Edge 打开本页面', suggestion: '更换浏览器' });
+    return;
   }
-}
+  if (!window.isSecureContext) {
+    showUploadError({ code: 'NotSecureContext', message: '页面不在安全上下文，Web Serial 已被浏览器禁用', suggestion: '请通过 https:// 或 http://localhost 访问' });
+    return;
+  }
+  if (!window.FirmwareUploader) {
+    showUploadError({ code: 'ScriptMissing', message: '注入引擎未加载（upload.js）', suggestion: '请刷新页面或检查站点文件是否完整' });
+    return;
+  }
 
-async function attachBleDevice(portId, device, options = {}) {
-  const sp = serialPorts[portId];
-  const server = await device.gatt.connect();
-  const service = await server.getPrimaryService(NUS_SERVICE_UUID);
-  const rxChar = await service.getCharacteristic(NUS_RX_CHAR_UUID);
-  const txChar = await service.getCharacteristic(NUS_TX_CHAR_UUID);
+  _uploadInProgress = true;
+  _uploadAbortController = new AbortController();
+  hideUploadError();
+  setUploadUIState(true);
+  appendLine('system', `[注入] 开始向 ${target.container} 注入脚本 …`, true);
 
-  sp.bluetoothDevice = device;
-  sp.gattServer = server;
-  sp.nusRxChar = rxChar;
-  sp.nusTxChar = txChar;
-  sp.bleLineBuffer = '';
-  sp.bleTextDecoder = new TextDecoder();
+  const sp = serialPorts.port1;
+  let port = null;
+  let ownedPort = false;   // 未连接时自行 requestPort 打开的端口（结束后负责 close/挂载）
+  let suspended = false;   // 是否挂起过游戏读循环
+  let baudRate = parseInt(baudRateSelect.value, 10) || 115200;
+  let result = null;
+  let fatalErr = null;
 
-  const onNotify = (event) => {
-    const value = event.target.value;
-    if (!value) return;
-    const chunk = sp.bleTextDecoder.decode(value, { stream: true });
-    sp.bleLineBuffer = processIncomingTextChunk(sp.bleLineBuffer, chunk, portId, {
-      flushChunkWithoutLineBreak: true,
+  try {
+    if (sp.transport === 'serial' && sp.isConnected && sp.port) {
+      // 游戏正持有端口：挂起读循环后复用同一端口（§5.10）
+      await suspendSerialForUpload('port1');
+      suspended = true;
+      port = sp.port;
+      baudRate = sp.baudRate || baudRate;
+    } else {
+      port = await navigator.serial.requestPort();
+      await port.open({ baudRate });
+      ownedPort = true;
+    }
+
+    result = await window.FirmwareUploader.inject({
+      port,
+      target,
+      sourceUrl: '/' + sourceFile,
+      sourceText: (window.FIRMWARE_FILES || {})[sourceFile],
+      filename: deviceFilename,
+      activate: target.kind === 'container',
+      signal: _uploadAbortController.signal,
+      onEvent: renderUploadEvent,
     });
-  };
-  sp.bleNotifyHandler = onNotify;
-  txChar.addEventListener('characteristicvaluechanged', onNotify);
-
-  const onGattDisconnected = () => {
-    const cur = serialPorts[portId];
-    if (cur.transport === 'ble') {
-      disconnectBle(portId, true, true).then(() => {
-        appendLine('system', `[${serialPorts[portId].label}] 蓝牙连接已丢失`, true);
-      });
-    }
-  };
-  sp.gattDisconnectHandler = onGattDisconnected;
-  device.addEventListener('gattserverdisconnected', onGattDisconnected);
-
-  await txChar.startNotifications();
-
-  sp.transport = 'ble';
-  sp.isConnected = true;
-
-  const name = device.name || 'BLE 设备';
-  const portDesc = `BLE · ${name}`;
-  updateGlobalConnected();
-  updatePortUI(portId, portDesc);
-  appendLine('system', `[${sp.label}] 已连接（蓝牙）— ${portDesc}`, true);
-  rememberBleConnection(device);
-}
-
-/** 连接中途失败或需强制释放 GATT（transport 可能尚未设为 ble） */
-async function cleanupFailedBleConnection(portId) {
-  const sp = serialPorts[portId];
-  try {
-    if (sp.nusTxChar && sp.bleNotifyHandler) {
-      sp.nusTxChar.removeEventListener('characteristicvaluechanged', sp.bleNotifyHandler);
-      await sp.nusTxChar.stopNotifications().catch(() => {});
-    }
-    if (sp.bluetoothDevice && sp.gattDisconnectHandler) {
-      sp.bluetoothDevice.removeEventListener('gattserverdisconnected', sp.gattDisconnectHandler);
-    }
-    if (sp.bluetoothDevice && sp.bluetoothDevice.gatt.connected) {
-      await sp.bluetoothDevice.gatt.disconnect();
-    }
-  } catch (e) {
-    console.error(`BLE cleanup (${portId}):`, e);
-  } finally {
-    sp.bleNotifyHandler = null;
-    sp.nusTxChar = null;
-    sp.nusRxChar = null;
-    sp.gattServer = null;
-    sp.bluetoothDevice = null;
-    sp.bleLineBuffer = '';
-    sp.bleTextDecoder = null;
-    sp.gattDisconnectHandler = null;
-    sp.transport = null;
-    sp.isConnected = false;
-    updateGlobalConnected();
-    updatePortUI(portId);
+  } catch (err) {
+    fatalErr = err;
   }
-}
 
-/** @param silentLog 为 true 时不输出系统提示（内部清理用） @param skipDisconnect 仅清理状态不调用 gatt.disconnect */
-async function disconnectBle(portId, silentLog, skipGattDisconnect) {
-  const sp = serialPorts[portId];
-  if (sp.transport !== 'ble') return;
-  sp.isConnected = false;
-  try {
-    if (sp.nusTxChar && sp.bleNotifyHandler) {
-      sp.nusTxChar.removeEventListener('characteristicvaluechanged', sp.bleNotifyHandler);
-      await sp.nusTxChar.stopNotifications().catch(() => {});
-    }
-    if (!skipGattDisconnect && sp.bluetoothDevice && sp.bluetoothDevice.gatt.connected) {
-      await sp.bluetoothDevice.gatt.disconnect();
-    }
-  } catch (e) {
-    console.error(`BLE disconnect (${portId}):`, e);
-  } finally {
-    if (sp.bluetoothDevice && sp.gattDisconnectHandler) {
-      sp.bluetoothDevice.removeEventListener('gattserverdisconnected', sp.gattDisconnectHandler);
-    }
-    try {
-      if (sp.bleTextDecoder) sp.bleTextDecoder.decode();
-    } catch (e2) { /* ignore flush */ }
-    sp.bleNotifyHandler = null;
-    sp.nusTxChar = null;
-    sp.nusRxChar = null;
-    sp.gattServer = null;
-    sp.bluetoothDevice = null;
-    sp.bleLineBuffer = '';
-    sp.bleTextDecoder = null;
-    sp.gattDisconnectHandler = null;
-    sp.transport = null;
-    sp.reader = null;
-    sp.readableStreamClosed = null;
-    updateGlobalConnected();
-    updatePortUI(portId);
-    if (!silentLog) {
-      clearRememberedHardwareConnection();
-      appendLine('system', `[${sp.label}] 蓝牙已断开`, true);
-    }
-  }
-}
+  // ===== 统一收尾：无论成功/失败/取消，恢复 UI 与端口归属 =====
+  _uploadInProgress = false;
+  _uploadAbortController = null;
+  setUploadUIState(false);
 
-async function toggleBleConnection(portId) {
-  const sp = serialPorts[portId];
-  if (sp.isConnected && sp.transport === 'ble') {
-    await disconnectBle(portId);
+  if (fatalErr) {
+    if (fatalErr.name === 'NotFoundError') {
+      appendLine('system', '[注入] 未选择设备，已取消', true);
+    } else {
+      showUploadError({ code: fatalErr.name || 'Error', message: fatalErr.message || String(fatalErr), suggestion: '' });
+      appendLine('error', `[注入异常] ${fatalErr.message}`, true);
+      console.error('Firmware injection error:', fatalErr);
+    }
+  } else if (result.ok) {
+    hideUploadError();
+    const modeLabel = result.mode === 'paste' ? 'raw paste' : '兼容模式（256B 分组）';
+    appendLine('system',
+      `${okMessage} — 目录: ${result.dir || '/'} · 文件: ${result.filename} · ${result.bytes}B`
+      + ` · CRC32: ${result.crc32} · ${modeLabel} · 耗时 ${result.ms}ms`, true);
+    if (result.note) appendLine('system', `[注入] ${result.note}`, true);
+    if (result.degraded && result.degraded.length) {
+      appendLine('system', `[注入] 降级项: ${result.degraded.join('，')}`, true);
+    }
+  } else if (result.code === 'Cancelled') {
+    // 用户主动取消是正常操作：系统消息提示，不弹错误面板
+    appendLine('system', '[注入] 已取消，设备上旧程序未受影响', true);
   } else {
-    await connectBlePort(portId);
+    showUploadError(result);
+    appendLine('error', `[注入失败][${result.code}] ${result.message}`, true);
+    if (result.deviceError) {
+      appendLine('error', `[设备报错] ${result.deviceError.split('\n')[0]}`, true);
+    }
   }
+
+  // 端口归属处理
+  if (ownedPort) {
+    if (!fatalErr && result && result.ok) {
+      // 挂成游戏端口，立即可见新程序的数据输出
+      try {
+        await attachSerialPort('port1', port, baudRate, { alreadyOpen: true });
+      } catch (err) {
+        try { await port.close(); } catch (_) {}
+        appendLine('system', '[注入] 设备复位后 USB 重枚举，请重新点击「连接」', true);
+      }
+    } else {
+      try { await port.close(); } catch (_) {}
+    }
+  } else if (suspended) {
+    resumeSerialAfterUpload('port1');
+  }
+}
+
+async function uploadFirmwareToContainer() {
+  const container = containerSelect ? containerSelect.value : 'container1';
+  await runFirmwareInjection(
+    { kind: 'container', container },
+    'hardware_main.py',          // 网页端源文件名（firmware.js 内嵌键）
+    `[注入完成] ${container}/钓鱼达人.py 已写入，可在设备端选择运行`,
+    '钓鱼达人.py'                // 设备端落盘文件名
+  );
+}
+
+function cancelFirmwareUpload() {
+  if (_uploadAbortController) _uploadAbortController.abort();
 }
 
 // ===== 发送数据 =====
@@ -921,17 +879,15 @@ function getPlatformHint() {
   }
 }
 
-// ===== UI 更新（单控制器：USB / 蓝牙 独立按钮状态） =====
+// ===== UI 更新（单控制器：USB 有线串口） =====
 function updatePortUI(portId, portDesc) {
   const sp = serialPorts[portId];
   const dot = statusDot1;
   const text = statusText1;
   const btn = connectBtn1;
-  const bleBtn = bleConnectBtn1;
   const infoEl = portInfo1El;
 
   const serialActive = sp.transport === 'serial' && sp.isConnected;
-  const bleActive = sp.transport === 'ble' && sp.isConnected;
 
   if (dot) dot.classList.toggle('connected', sp.isConnected);
   if (text) text.textContent = sp.isConnected ? '已连接' : '未连接';
@@ -942,27 +898,13 @@ function updatePortUI(portId, portDesc) {
     if (spanEl) spanEl.textContent = serialActive ? '断开' : '连接';
   }
 
-  if (bleBtn) {
-    bleBtn.classList.toggle('connected', bleActive);
-    const spanEl = bleBtn.querySelector('span');
-    if (spanEl) spanEl.textContent = bleActive ? '断开' : '蓝牙';
-  }
-
   if (infoEl) {
     if (sp.isConnected && portDesc) {
       infoEl.textContent = portDesc;
       infoEl.classList.add('visible');
-    } else if (sp.isConnected && !portDesc) {
-      if (serialActive) {
-        infoEl.textContent = 'USB 已连接';
-        infoEl.classList.add('visible');
-      } else if (bleActive) {
-        infoEl.textContent = '蓝牙已连接';
-        infoEl.classList.add('visible');
-      } else {
-        infoEl.textContent = '';
-        infoEl.classList.remove('visible');
-      }
+    } else if (sp.isConnected) {
+      infoEl.textContent = 'USB 已连接';
+      infoEl.classList.add('visible');
     } else {
       infoEl.textContent = '';
       infoEl.classList.remove('visible');
@@ -978,6 +920,9 @@ if (autoScrollBtn) autoScrollBtn.classList.add('active');
 // 监听串口断开事件（单控制器，仅 USB）
 if ('serial' in navigator) {
   navigator.serial.addEventListener('disconnect', (e) => {
+    // 注入会话期间设备会 soft_reset，原生 USB 口可能瞬时重枚举触发本事件；
+    // 此时端口归注入引擎所有，跳过状态清理，由注入收尾统一处理（§5.3-D6）
+    if (_uploadInProgress) return;
     for (const portId of ['port1']) {
       const sp = serialPorts[portId];
       if (sp.transport === 'serial' && sp.port && e.target === sp.port) {
@@ -13355,5 +13300,6 @@ window.toggleAutoScroll = toggleAutoScroll;
 window.toggleSerialOutput = toggleSerialOutput;
 window.openInNewWindow = openInNewWindow;
 window.toggleSerialPanel = toggleSerialPanel;
-window.toggleBleConnection = toggleBleConnection;
+window.uploadFirmwareToContainer = uploadFirmwareToContainer;
+window.cancelFirmwareUpload = cancelFirmwareUpload;
 window.serialPorts = serialPorts;
