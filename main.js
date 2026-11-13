@@ -23,6 +23,7 @@ let isConnected = false;
 let _uploadInProgress = false;
 let _uploadAbortController = null;
 let _serialRecoveryInProgress = false; // 串口自愈进行中：并发自愈与注入启动都拒绝，防竞争同一端口
+let _wifiInProgress = false;           // WiFi 配网会话进行中：与注入/游戏指令互斥（共用端口）
 
 // ===== 串口调试缓冲区（全局可见） =====
 window._serialDebug = {
@@ -66,6 +67,13 @@ const uploadErrorEl = document.getElementById('uploadError');
 const uploadErrorMsg = document.getElementById('uploadErrorMsg');
 const uploadErrorDetail = document.getElementById('uploadErrorDetail');
 const uploadHintEl = document.getElementById('uploadHint');
+const wifiSsidEl = document.getElementById('wifiSsid');
+const wifiPwdEl = document.getElementById('wifiPwd');
+const wifiConnectBtn = document.getElementById('wifiConnectBtn');
+const wifiEyeBtn = document.getElementById('wifiEyeBtn');
+const wifiStatusEl = document.getElementById('wifiStatus');
+const wifiStatusDotEl = document.getElementById('wifiStatusDot');
+const wifiStatusTextEl = document.getElementById('wifiStatusText');
 
 // ===== 环境检测 =====
 const isInIframe = window.self !== window.top;
@@ -86,6 +94,7 @@ function checkEnvironment() {
     browserNotice.style.display = 'flex';
     if (connectBtn1) connectBtn1.disabled = true;
     if (uploadFirmwareBtn) uploadFirmwareBtn.disabled = true;
+    if (wifiConnectBtn) wifiConnectBtn.disabled = true;
   }
 
   return serialOk;
@@ -213,8 +222,8 @@ async function toggleConnection(portId) {
 
 async function connectPort(portId) {
   const sp = serialPorts[portId];
-  if (_uploadInProgress) {
-    appendLine('error', '脚本注入进行中，请先等待完成或取消', true);
+  if (_uploadInProgress || _wifiInProgress) {
+    appendLine('error', '设备会话进行中（注入/WiFi 配置），请先等待完成', true);
     return;
   }
   try {
@@ -229,8 +238,8 @@ async function connectPort(portId) {
 }
 
 async function disconnectPort(portId, silentLog) {
-  if (_uploadInProgress) {
-    appendLine('error', '脚本注入进行中，无法断开连接', true);
+  if (_uploadInProgress || _wifiInProgress) {
+    appendLine('error', '设备会话进行中（注入/WiFi 配置），无法断开连接', true);
     return;
   }
   const sp = serialPorts[portId];
@@ -339,8 +348,8 @@ async function readLoopForPort(portId) {
     }
     // 读循环退出且并非用户主动断开时，清理“假连接”状态并自愈；
     // 否则界面仍显示已连接、游戏继续发指令，硬件端输出无人接收会被堵死。
-    // 脚本注入期间读循环是被主动挂起的，跳过自愈（§5.10 端口互斥）。
-    if (sp.transport === 'serial' && sp.isConnected && !_uploadInProgress) {
+    // 注入/WiFi 会话期间读循环是被主动挂起的，跳过自愈（§5.10 端口互斥）。
+    if (sp.transport === 'serial' && sp.isConnected && !_uploadInProgress && !_wifiInProgress) {
       await forceSerialRecovery(portId, 'read-loop-exited');
     }
   }
@@ -352,7 +361,7 @@ async function readLoopForPort(portId) {
  *  且 runFirmwareInjection 会拒绝启动——防止自愈 reopen 与注入
  *  requestPort/open 竞争同一 SerialPort（审计 1b 竞态）。 */
 async function forceSerialRecovery(portId, reason) {
-  if (_uploadInProgress) return;
+  if (_uploadInProgress || _wifiInProgress) return;
   if (_serialRecoveryInProgress) return;
   _serialRecoveryInProgress = true;
   try {
@@ -414,8 +423,8 @@ let _serialStallWarned = false;
 
 setInterval(() => {
   const sp = serialPorts.port1;
-  if (_uploadInProgress) {
-    // 注入会话期间设备被注入流程占用，看门狗整体暂停，避免误判静默
+  if (_uploadInProgress || _wifiInProgress) {
+    // 注入/WiFi 会话期间设备被会话流程占用，看门狗整体暂停，避免误判静默
     _serialStallWarned = false;
     return;
   }
@@ -438,11 +447,12 @@ setInterval(() => {
   }
 }, 1000);
 
-/** USB 串口统一写出（供终端与游戏内指令）；注入会话期间暂停 */
+/** USB 串口统一写出（供终端与游戏内指令）；注入/WiFi 会话期间暂停 */
 async function writeToPort(portId, text) {
   const sp = serialPorts[portId];
   if (!sp.isConnected) throw new Error('未连接');
   if (_uploadInProgress) throw new Error('脚本注入进行中，暂停发送指令');
+  if (_wifiInProgress) throw new Error('WiFi 配置进行中，暂停发送指令');
   const encoder = new TextEncoder();
   const data = encoder.encode(text);
   if (!sp.port || !sp.port.writable) throw new Error('串口不可写');
@@ -478,6 +488,10 @@ function setUploadUIState(running) {
   if (uploadCancelBtn) uploadCancelBtn.style.display = running ? '' : 'none';
   if (uploadStatusEl) uploadStatusEl.style.display = running ? '' : 'none';
   if (!running && uploadProgressFill) uploadProgressFill.style.width = '0%';
+  // 注入与 WiFi 共用端口互斥：任一会话期间锁 WiFi 入口（红线 8）
+  if (wifiConnectBtn) wifiConnectBtn.disabled = running || !envReady;
+  if (running) wifiConnectBtn?.classList.add('busy');
+  else wifiConnectBtn?.classList.remove('busy');
 }
 
 function renderUploadEvent(e) {
@@ -548,7 +562,7 @@ function resumeSerialAfterUpload(portId) {
 // sourceFile: 网页端源文件名（firmware.js 内嵌的键，如 'hardware_main.py'）
 // deviceFilename: 设备端落盘文件名（默认与 sourceFile 同名；可不同，如中文名 '钓鱼达人.py'）
 async function runFirmwareInjection(target, sourceFile, okMessage, deviceFilename) {
-  if (_uploadInProgress) return;
+  if (_uploadInProgress || _wifiInProgress) return;
   if (_serialRecoveryInProgress) {
     showUploadError({ code: 'RecoveryInProgress', message: '串口自动恢复进行中，请稍候再注入', suggestion: '等终端出现「已恢复 USB 连接」或恢复失败提示后重试' });
     return;
@@ -671,6 +685,267 @@ async function uploadFirmwareToContainer() {
 
 function cancelFirmwareUpload() {
   if (_uploadAbortController) _uploadAbortController.abort();
+}
+
+// ===== WiFi 配置（一次性 raw REPL 执行，方案见《网页端WiFi配网-可移植通用方案.md》） =====
+// 引擎层 exec() 见 upload.js；本节只做三件事（与注入的 §5.10/§6 对齐）：
+// 1. 脚本组装：用户输入经 Python 字符串转义后填入模板（红线 1：禁止裸拼）
+// 2. 结果解析：WIFIEXC > WIFITIMEOUT > WIFIRESULT|n > WIFICB 原文（§6.3）
+// 3. 端口互斥：与注入/游戏指令互斥；自开端口用完即 close，不抢占游戏端口
+
+// 用户输入 → Python 单引号字符串字面量（§6.1 安全红线：SSID/密码是任意输入）
+function pyStringLiteral(s) {
+  const escaped = String(s)
+    .replace(/\\/g, '\\\\')      // 反斜杠最先转义
+    .replace(/'/g, "\\'")        // 单引号（模板用单引号字面量）
+    .replace(/\r/g, '\\r')
+    .replace(/\n/g, '\\n')
+    .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g,
+      (c) => '\\x' + c.charCodeAt(0).toString(16).padStart(2, '0'));
+  return "'" + escaped + "'";
+}
+
+// 设备侧载荷（§5 模板，经源项目实机验证）：自限时 25s、回调双形态兼容、
+// EXEC_DONE 必达。超时层级红线：25s（设备自限时）< 35s（exec 首帧等待）
+const WIFI_DEVICE_WAIT_MS = 25000;
+const WIFI_EXEC_TIMEOUT_MS = 35000;
+
+function buildWifiScript(ssid, pwd) {
+  const L = [];
+  L.push('import wifi, time');
+  L.push('SSID = ' + pyStringLiteral(ssid));
+  L.push('PWD = ' + pyStringLiteral(pwd));
+  L.push('_cb_args = [None]');
+  L.push('');
+  L.push('def _cb(*a):');
+  L.push('    _cb_args[0] = a');
+  L.push('    print("WIFICB:" + str(a))');
+  L.push('');
+  L.push('try:');
+  L.push('    wifi.connect(SSID, PWD, 3, _cb)');
+  L.push('except Exception as e:');
+  L.push('    print("WIFIEXC:" + str(type(e).__name__) + ":" + str(e))');
+  L.push('');
+  L.push('_deadline = time.ticks_add(time.ticks_ms(), ' + WIFI_DEVICE_WAIT_MS + ')');
+  L.push('while _cb_args[0] is None and time.ticks_diff(time.ticks_ms(), _deadline) < 0:');
+  L.push('    time.sleep_ms(200)');
+  L.push('');
+  L.push('if _cb_args[0] is None:');
+  L.push('    print("WIFITIMEOUT")');
+  L.push('else:');
+  L.push('    _reason = None');
+  L.push('    _a = _cb_args[0]');
+  L.push('    try:');
+  L.push('        if len(_a) == 1 and isinstance(_a[0], dict):');
+  L.push('            _reason = _a[0].get("reason")');
+  L.push('        elif len(_a) >= 2:');
+  L.push('            _reason = _a[1]');
+  L.push('    except Exception:');
+  L.push('        pass');
+  L.push('    if _reason is None:');
+  L.push('        print("WIFIRESULT|UNKNOWN")');
+  L.push('    else:');
+  L.push('        print("WIFIRESULT|" + str(_reason))');
+  L.push('print("EXEC_DONE")');
+  return L.join('\n');
+}
+
+// reason 码 → 用户可见文案（§5.1，星瀚 = ESP-IDF 系；移植时只换表不换机制）
+const WIFI_REASON_TEXT = {
+  0: '已连接 ✓ 固件已记住该网络，下次开机自动连',
+  15: '四路握手超时 — 密码错误的可能性大，请检查后重试',
+  200: '信标超时 — 信号不稳定，请靠近路由器重试',
+  201: '找不到该 WiFi — 名称不对或信号太弱',
+  202: '认证失败 — 密码错误',
+  203: '关联失败',
+  204: '握手失败',
+  205: '连接失败',
+  400: '参数错误 — WiFi 名称为空或过长',
+  401: '密码过长',
+  402: '连接超时',
+  403: 'WiFi 开关未打开',
+  404: '认证模式无效',
+  405: '内部错误',
+  406: '内存不足',
+};
+
+// 状态行三态渲染（§6.2：ok 绿 / err 红 / busy 黄）
+function setWifiStatus(kind, text) {
+  if (!wifiStatusEl) return;
+  wifiStatusEl.style.display = '';
+  wifiStatusEl.className = 'wifi-status ' + kind;
+  if (wifiStatusTextEl) wifiStatusTextEl.textContent = text;
+}
+
+function hideWifiStatus() {
+  if (wifiStatusEl) wifiStatusEl.style.display = 'none';
+}
+
+function setWifiBusyUI(running) {
+  if (wifiConnectBtn) {
+    wifiConnectBtn.disabled = running || !envReady;
+    wifiConnectBtn.classList.toggle('busy', running);
+    const span = wifiConnectBtn.querySelector('span');
+    if (span) span.textContent = running ? '连接中…' : '连接 WiFi';
+  }
+  if (wifiSsidEl) wifiSsidEl.disabled = running;
+  if (wifiPwdEl) wifiPwdEl.disabled = running;
+  // 注入入口同步互斥（红线 8：任一设备会话期间锁全部设备入口）
+  if (uploadFirmwareBtn) uploadFirmwareBtn.disabled = running || !envReady;
+  if (containerSelect) containerSelect.disabled = running;
+  if (connectBtn1) connectBtn1.disabled = running || !envReady;
+}
+
+function toggleWifiPwdVisibility() {
+  if (!wifiPwdEl) return;
+  const show = wifiPwdEl.type === 'password';
+  wifiPwdEl.type = show ? 'text' : 'password';
+  if (wifiEyeBtn) wifiEyeBtn.classList.toggle('active', show);
+  wifiPwdEl.focus();
+}
+
+// 解析 exec stdout → { kind: 'exc'|'timeout'|'result'|'unknown', reason, cbText, excText }
+// 判定优先级（§6.3）：WIFIEXC > WIFITIMEOUT > WIFIRESULT|n > WIFICB 原文
+function parseWifiStdout(stdout) {
+  const out = {
+    kind: 'unknown', reason: null, cbText: '', excText: '',
+  };
+  const excMatch = stdout.match(/WIFIEXC:([^\r\n]*)/);
+  if (excMatch) {
+    out.kind = 'exc';
+    out.excText = excMatch[1];
+    return out;
+  }
+  if (/WIFITIMEOUT/.test(stdout)) {
+    out.kind = 'timeout';
+    return out;
+  }
+  const resMatch = stdout.match(/WIFIRESULT\|(-?\d+)/);
+  if (resMatch) {
+    out.kind = 'result';
+    out.reason = parseInt(resMatch[1], 10);
+  }
+  // 回调原文单行保留，UNKNOWN 排障用（红线 6）
+  const cbMatch = stdout.match(/WIFICB:(.*)/);
+  out.cbText = cbMatch ? cbMatch[1] : '';
+  return out;
+}
+
+async function runWifiConnect() {
+  if (_uploadInProgress || _wifiInProgress) return;
+  if (_serialRecoveryInProgress) {
+    setWifiStatus('err', '串口自动恢复进行中，请稍候再试');
+    return;
+  }
+  if (!('serial' in navigator)) {
+    setWifiStatus('err', '当前浏览器不支持 Web Serial，请使用 Chrome / Edge 打开本页面');
+    return;
+  }
+  if (!window.isSecureContext) {
+    setWifiStatus('err', '页面不在安全上下文，Web Serial 已被浏览器禁用（需 https:// 或 localhost）');
+    return;
+  }
+  if (!window.FirmwareUploader || typeof window.FirmwareUploader.exec !== 'function') {
+    setWifiStatus('err', '注入引擎未加载 exec 能力（upload.js），请刷新页面');
+    return;
+  }
+
+  const ssid = (wifiSsidEl ? wifiSsidEl.value : '').trim();
+  const pwd = wifiPwdEl ? wifiPwdEl.value : '';
+  if (!ssid) {
+    setWifiStatus('err', '请填写 WiFi 名称');
+    wifiSsidEl?.focus();
+    return;
+  }
+  if (pwd.length > 64) {
+    setWifiStatus('err', '密码过长（最多 64 字符）');
+    return;
+  }
+
+  _wifiInProgress = true;
+  hideWifiStatus();
+  setWifiBusyUI(true);
+  appendLine('system', `[WiFi] 开始连接「${ssid}」…（执行期间设备程序暂停约 30s）`, true);
+
+  const sp = serialPorts.port1;
+  let port = null;
+  let ownedPort = false;   // 未连接时自行 requestPort 打开的端口（用完即 close，不抢占游戏端口）
+  let suspended = false;   // 是否挂起过游戏读循环
+  let baudRate = parseInt(baudRateSelect.value, 10) || 115200;
+
+  try {
+    if (sp.transport === 'serial' && sp.isConnected && sp.port) {
+      // 游戏正持有端口：挂起读循环后复用（与注入同一互斥逻辑）
+      await suspendSerialForUpload('port1');
+      suspended = true;
+      port = sp.port;
+      baudRate = sp.baudRate || baudRate;
+    } else {
+      port = await navigator.serial.requestPort();
+      await port.open({ baudRate });
+      ownedPort = true;
+    }
+
+    const result = await window.FirmwareUploader.exec({
+      port,
+      script: buildWifiScript(ssid, pwd),
+      execTimeoutMs: WIFI_EXEC_TIMEOUT_MS,
+    });
+
+    // ===== 结果解析与上屏（判定优先级见 parseWifiStdout） =====
+    if (!result.ok && !result.stdout) {
+      // 连 EXEC_DONE 都没有：引擎层失败（超时/断开/取消），rawTail 已由引擎收集
+      const cancelHint = result.code === 'Cancelled' ? '已取消' : '';
+      setWifiStatus('err', `${cancelHint ? cancelHint + ' — ' : ''}${result.message}`
+        + (result.rawTail ? `（设备最后输出: ${result.rawTail.slice(-120)}）` : ''));
+      appendLine('error', `[WiFi 失败][${result.code}] ${result.message}`, true);
+    } else {
+      const parsed = parseWifiStdout(result.stdout);
+      if (parsed.kind === 'exc') {
+        setWifiStatus('err', `设备连接调用异常：${parsed.excText}`);
+        appendLine('error', `[WiFi] WIFIEXC: ${parsed.excText}`, true);
+      } else if (parsed.kind === 'timeout') {
+        setWifiStatus('err', '等待设备回调超时（25s 内无响应），请重试；反复出现请检查固件 wifi 模块');
+        appendLine('error', '[WiFi] WIFITIMEOUT：回调始终未到', true);
+      } else if (parsed.kind === 'result' && parsed.reason === 0) {
+        setWifiStatus('ok', WIFI_REASON_TEXT[0]);
+        appendLine('system', `[WiFi] 已连接「${ssid}」— 固件已记住，下次开机自动连（${result.ms}ms）`, true);
+      } else if (parsed.kind === 'result') {
+        const text = WIFI_REASON_TEXT[parsed.reason]
+          || `连接失败（reason=${parsed.reason}）`;
+        setWifiStatus('err', text + (parsed.cbText ? ` · 回调原文: ${parsed.cbText}` : ''));
+        appendLine('error', `[WiFi] WIFIRESULT|${parsed.reason} — ${text}`, true);
+      } else {
+        // UNKNOWN：形态未预期，保留 WIFICB 原文排障（红线 6）
+        setWifiStatus('err', `未能解析连接结果${parsed.cbText ? ` · 回调原文: ${parsed.cbText}` : '（无回调原文），请把终端日志反馈排查'}`);
+        appendLine('error', `[WiFi] 结果未识别 — stdout: ${result.stdout.replace(/\s+/g, ' ').slice(0, 200)}`, true);
+      }
+      if (parsed.cbText) {
+        appendLine('system', `[WiFi] WIFICB 回调原文: ${parsed.cbText}`, true);
+      }
+      if (result.stderr && result.stderr.trim()) {
+        appendLine('error', `[WiFi] 设备 stderr: ${result.stderr.trim().split('\n')[0]}`, true);
+      }
+    }
+  } catch (err) {
+    if (err.name === 'NotFoundError') {
+      appendLine('system', '[WiFi] 未选择设备，已取消', true);
+    } else {
+      setWifiStatus('err', `连接流程异常: ${err.message}`);
+      appendLine('error', `[WiFi 异常] ${err.message}`, true);
+      console.error('WiFi connect error:', err);
+    }
+  } finally {
+    // ===== 统一收尾（红线 5：配网后必须归还端口） =====
+    if (ownedPort) {
+      // 自开端口用完即 close：配网是低频操作，不抢占游戏端口
+      try { await port.close(); } catch (e) { /* ignore */ }
+    } else if (suspended) {
+      resumeSerialAfterUpload('port1');
+    }
+    _wifiInProgress = false;
+    setWifiBusyUI(false);
+  }
 }
 
 // ===== 发送数据 =====
@@ -920,9 +1195,9 @@ if (autoScrollBtn) autoScrollBtn.classList.add('active');
 // 监听串口断开事件（单控制器，仅 USB）
 if ('serial' in navigator) {
   navigator.serial.addEventListener('disconnect', (e) => {
-    // 注入会话期间设备会 soft_reset，原生 USB 口可能瞬时重枚举触发本事件；
-    // 此时端口归注入引擎所有，跳过状态清理，由注入收尾统一处理（§5.3-D6）
-    if (_uploadInProgress) return;
+    // 注入/WiFi 会话期间设备会执行临时脚本，原生 USB 口可能瞬时重枚举触发本事件；
+    // 此时端口归会话引擎所有，跳过状态清理，由会话收尾统一处理（§5.3-D6）
+    if (_uploadInProgress || _wifiInProgress) return;
     for (const portId of ['port1']) {
       const sp = serialPorts[portId];
       if (sp.transport === 'serial' && sp.port && e.target === sp.port) {
@@ -13302,4 +13577,6 @@ window.openInNewWindow = openInNewWindow;
 window.toggleSerialPanel = toggleSerialPanel;
 window.uploadFirmwareToContainer = uploadFirmwareToContainer;
 window.cancelFirmwareUpload = cancelFirmwareUpload;
+window.runWifiConnect = runWifiConnect;
+window.toggleWifiPwdVisibility = toggleWifiPwdVisibility;
 window.serialPorts = serialPorts;

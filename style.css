@@ -358,6 +358,159 @@ h1 {
   line-height: 1.45;
 }
 
+/* ===== WiFi 配置卡片（一次性 raw REPL 执行，方案见《网页端WiFi配网-可移植通用方案.md》） ===== */
+.wifi-bar {
+  gap: 8px;
+}
+
+.wifi-field {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1;
+  min-width: 140px;
+}
+
+.wifi-field label {
+  font-size: 0.75rem;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+.wifi-field input {
+  flex: 1;
+  min-width: 0;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  color: var(--text);
+  font-size: 0.75rem;
+  font-family: var(--font-mono);
+  padding: 5px 8px;
+  border-radius: 7px;
+  outline: none;
+  transition: border-color 0.2s;
+}
+
+.wifi-field input::placeholder {
+  color: var(--text-dim);
+  opacity: 0.7;
+}
+
+.wifi-field input:hover {
+  border-color: var(--border-hover);
+}
+
+.wifi-field input:focus {
+  border-color: var(--accent);
+}
+
+.wifi-field input:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.wifi-pwd-wrap {
+  position: relative;
+  flex: 1;
+  display: flex;
+  align-items: center;
+  min-width: 0;
+}
+
+.wifi-pwd-wrap input {
+  padding-right: 30px;
+  width: 100%;
+}
+
+.wifi-eye-btn {
+  position: absolute;
+  right: 2px;
+  width: 24px;
+  height: 24px;
+  flex: none;
+}
+
+.btn-wifi {
+  background: var(--accent-glow);
+  color: var(--accent-hover);
+  border: 1px solid rgba(108, 114, 255, 0.4);
+  padding: 7px 14px;
+}
+
+.btn-wifi:hover:not(:disabled) {
+  background: rgba(108, 114, 255, 0.22);
+  border-color: rgba(108, 114, 255, 0.65);
+}
+
+.btn-wifi:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.btn-wifi.busy {
+  color: var(--yellow);
+  border-color: rgba(251, 191, 36, 0.5);
+  background: rgba(251, 191, 36, 0.08);
+}
+
+/* 状态行三态：ok 绿 / err 红 / busy 黄（§6.2） */
+.wifi-status {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  padding: 7px 10px;
+  border-radius: 8px;
+  font-size: 0.7rem;
+  line-height: 1.5;
+  word-break: break-all;
+}
+
+.wifi-status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  margin-top: 4px;
+  flex: none;
+}
+
+.wifi-status.ok {
+  background: rgba(52, 211, 153, 0.07);
+  border: 1px solid rgba(52, 211, 153, 0.3);
+  color: var(--green);
+}
+
+.wifi-status.ok .wifi-status-dot {
+  background: var(--green);
+  box-shadow: 0 0 6px var(--green-glow);
+}
+
+.wifi-status.err {
+  background: rgba(248, 113, 113, 0.06);
+  border: 1px solid rgba(248, 113, 113, 0.3);
+  color: var(--red);
+}
+
+.wifi-status.err .wifi-status-dot {
+  background: var(--red);
+  box-shadow: 0 0 6px var(--red-glow);
+}
+
+.wifi-status.busy {
+  background: rgba(251, 191, 36, 0.06);
+  border: 1px solid rgba(251, 191, 36, 0.3);
+  color: var(--yellow);
+}
+
+.wifi-status.busy .wifi-status-dot {
+  background: var(--yellow);
+  box-shadow: 0 0 6px rgba(251, 191, 36, 0.3);
+  animation: wifi-busy-blink 1s ease-in-out infinite;
+}
+
+@keyframes wifi-busy-blink {
+  50% { opacity: 0.3; }
+}
+
 .status-dot {
   width: 7px;
   height: 7px;

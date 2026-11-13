@@ -45,6 +45,7 @@
     Timeout:             { message: '会话总时长超限', suggestion: '请重试；反复超时请检查波特率与数据线' },
     FetchFailed:         { message: '读取脚本源码失败', suggestion: '确认站点根目录存在 hardware_main.py / device_main.py' },
     BadTarget:           { message: '非法注入目标', suggestion: '容器仅允许 container1..container5' },
+    BadScript:           { message: '一次性脚本为空', suggestion: '检查调用方脚本组装逻辑' },
     PortError:           { message: '串口读写异常', suggestion: '请重新插拔设备后重试' },
   };
 
@@ -375,11 +376,14 @@
     // R：按 \x04 切帧读执行结果（§5.3-R，红线 1：禁止整段子串匹配）
     // paste: \x04(编译完) <stdout> \x04 <stderr> \x04 >
     // raw:   OK <stdout> \x04 <stderr> \x04 >
-    async readExecResult(mode) {
+    // compileTimeoutMs 可参数化：一次性脚本（如 WiFi 连接）首帧要等脚本整体
+    // 跑完才发出，毫秒级默认值会误杀（exec 会话传入更大值，§4.2）
+    async readExecResult(mode, compileTimeoutMs) {
+      const tCompile = compileTimeoutMs || T_COMPILE;
       if (mode === 'paste') {
-        await this.link.readUntil(frameEndMatcher, T_COMPILE, '等待编译完成帧', this.signal);
+        await this.link.readUntil(frameEndMatcher, tCompile, '等待编译完成帧', this.signal);
       } else {
-        await this.link.readUntil(textMatcher('OK'), T_COMPILE, '等待 OK 应答', this.signal);
+        await this.link.readUntil(textMatcher('OK'), tCompile, '等待 OK 应答', this.signal);
       }
       const stdout = await this.link.readUntil(frameEndMatcher, T_OUTPUT, '等待输出帧', this.signal);
       let stderr = [];
@@ -431,6 +435,23 @@
         return null;
       };
       return await this.link.readUntil(bannerMatcher, T_BANNER, '等待设备启动横幅', this.signal);
+    }
+
+    // exec 会话的常规退出：Ctrl-C ×2 取消可能停留的 paste 态 → Ctrl-B 回 friendly
+    // REPL。不 soft_reset —— 一次性脚本不改文件系统，避免复位打断设备当前状态
+    // （§4.2 与 inject 的差异点）。失败忽略：端口已死时无从恢复
+    async exitRawKeepState() {
+      try {
+        await this.link.write(new Uint8Array([CTRL_C, CTRL_C]));
+      } catch (e) { /* ignore */ }
+      try {
+        await this.link.write(new Uint8Array([CTRL_B]));
+        await this.link.readUntil(textMatcher('>>>'), T_EXIT, '等待 friendly 提示符', this.signal);
+      } catch (e) {
+        if (e.code === 'Cancelled' || e.code === 'DeviceGone') throw e;
+        // 无提示符也继续：Ctrl-B 已发出，设备多数情况已回 friendly
+      }
+      this.link.clearBuf();
     }
   }
 
@@ -754,8 +775,91 @@
     }
   }
 
+  /**
+   * 一次性脚本执行（inject 的姊妹 API，复用同一协议层）。
+   * 脚本在设备 RAM 中编译运行、跑完即弃，设备文件系统零残留。
+   * 脚本契约（§4.3）：末尾必须 print("EXEC_DONE") 且设备侧自限时，
+   * 保证 EXEC_DONE 必达 —— ok 判定依据脚本契约标记，不靠浏览器超时兜底。
+   * @param {Object} opts
+   * @param {SerialPort} opts.port            已打开的串口（生命周期归调用方）
+   * @param {string} opts.script              Python 源码；末尾必须 print("EXEC_DONE")
+   * @param {number} [opts.execTimeoutMs=35000] 首帧等待上限（必须 > 设备侧自限时，§7 红线）
+   * @param {boolean} [opts.reboot=false]     true 时走 inject 同款 soft_reset + 横幅观察
+   * @param {AbortSignal} [opts.signal]
+   * @param {Function} [opts.onEvent]         {phase, detail} 进度回调
+   * @returns {Promise<Object>} { ok, stdout, stderr, ms, mode, degraded }
+   *   ok = stdout 含 EXEC_DONE 且 stderr 为空
+   */
+  async function exec(opts) {
+    const startedAt = Date.now();
+    const emit = opts.onEvent || (() => {});
+    const execTimeoutMs = typeof opts.execTimeoutMs === 'number' ? opts.execTimeoutMs : 35000;
+
+    if (!opts.script || typeof opts.script !== 'string') {
+      return fail('BadScript', { message: '一次性脚本为空' }, null, startedAt);
+    }
+
+    const link = new SerialLink(opts.port);
+    try {
+      await link.start();
+    } catch (e) {
+      return fail('PortError', { message: '无法接管串口读写流: ' + e.message }, null, startedAt);
+    }
+    const proto = new MicroPyProtocol(link, opts);
+    const scriptBytes = new TextEncoder().encode(opts.script);
+
+    try {
+      emit({ phase: 'HALTING', detail: '打断设备当前程序' });
+      await proto.halt();
+      emit({ phase: 'PROBING', detail: '探测 raw paste 支持' });
+      const cap = await proto.probePaste();
+      emit({ phase: 'PROBED', detail: cap.mode === 'paste' ? 'raw paste（窗口 ' + cap.windowInc + '）' : '兼容模式（256B 分组）' });
+
+      emit({ phase: 'TRANSFERRING', sent: 0, total: scriptBytes.length });
+      const onProgress = (sent, total) => emit({ phase: 'TRANSFERRING', sent, total });
+      if (cap.mode === 'paste') {
+        await proto.pasteTransfer(scriptBytes, cap.windowInc, onProgress);
+      } else {
+        await proto.rawTransfer(scriptBytes, onProgress);
+      }
+
+      emit({ phase: 'RUNNING', detail: '脚本执行中（最长等 ' + Math.round(execTimeoutMs / 1000) + 's）' });
+      const result = await proto.readExecResult(cap.mode, execTimeoutMs);
+
+      // 常规退出：退回 friendly REPL，不 soft_reset（一次性脚本无文件系统残留）
+      emit({ phase: 'EXITING', detail: '退回常规 REPL' });
+      try {
+        await proto.exitRawKeepState();
+      } catch (e) {
+        if (e.code === 'Cancelled') throw e;
+        proto.degraded.push('ExitRawFailed');
+      }
+
+      const ok = result.stdout.indexOf('EXEC_DONE') >= 0 && !result.stderr.trim();
+      return {
+        ok,
+        stdout: result.stdout,
+        stderr: result.stderr,
+        ms: Date.now() - startedAt,
+        mode: cap.mode,
+        degraded: proto.degraded,
+      };
+    } catch (e) {
+      const code = e.code || (e.name === 'AbortError' ? 'Cancelled' : 'PortError');
+      // 尽力恢复：Ctrl-C×2 取消残留 paste 态 → Ctrl-B 回 friendly（不 soft_reset）
+      try {
+        await link.write(new Uint8Array([CTRL_C, CTRL_C]));
+        await link.write(new Uint8Array([CTRL_B]));
+      } catch (e2) { /* 端口已死则放弃 */ }
+      return fail(code, { message: e.message }, link, startedAt);
+    } finally {
+      await link.release();
+    }
+  }
+
   window.FirmwareUploader = {
     inject,
+    exec,
     crc32,
     crc32hex,
     // 供测试/诊断

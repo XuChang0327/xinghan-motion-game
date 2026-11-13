@@ -150,6 +150,42 @@
         </div>
       </div>
 
+      <!-- WiFi 配置（一次性 raw REPL 执行，方案见《网页端WiFi配网-可移植通用方案.md》） -->
+      <div class="upload-bar wifi-bar" id="wifiBar">
+        <div class="upload-controls">
+          <div class="wifi-field">
+            <label for="wifiSsid">WiFi 名称</label>
+            <input type="text" id="wifiSsid" placeholder="WiFi 名称" autocomplete="off" spellcheck="false" maxlength="32">
+          </div>
+          <div class="wifi-field">
+            <label for="wifiPwd">密码</label>
+            <div class="wifi-pwd-wrap">
+              <input type="password" id="wifiPwd" placeholder="密码" autocomplete="new-password" maxlength="64">
+              <button class="btn-icon wifi-eye-btn" id="wifiEyeBtn" onclick="toggleWifiPwdVisibility()" title="显示/隐藏密码">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="15" height="15">
+                  <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/>
+                  <circle cx="12" cy="12" r="3"/>
+                </svg>
+              </button>
+            </div>
+          </div>
+          <button class="btn btn-wifi" id="wifiConnectBtn" onclick="runWifiConnect()" title="把 WiFi 凭据通过一次性脚本发送到设备连接；成功后固件记住该网络，下次开机自动连">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="14" height="14">
+              <path d="M5 12.55a11 11 0 0 1 14.08 0"/>
+              <path d="M1.42 9a16 16 0 0 1 21.16 0"/>
+              <path d="M8.53 16.11a6 6 0 0 1 6.95 0"/>
+              <line x1="12" y1="20" x2="12.01" y2="20"/>
+            </svg>
+            <span>连接 WiFi</span>
+          </button>
+        </div>
+        <p class="upload-hint" id="wifiHint">填入 WiFi 名称与密码 →「连接 WiFi」。执行期间设备程序会暂停约半分钟，成功后固件记住网络，下次开机自动连。</p>
+        <div class="wifi-status" id="wifiStatus" style="display:none;">
+          <span class="wifi-status-dot" id="wifiStatusDot"></span>
+          <span class="wifi-status-text" id="wifiStatusText"></span>
+        </div>
+      </div>
+
       <!-- 数据终端 -->
       <div class="terminal-wrapper">
         <div class="terminal-header">
